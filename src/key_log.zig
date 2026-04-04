@@ -27,13 +27,15 @@ pub const Callback = *const fn (label: []const u8, client_random: []const u8, se
 pub fn callback(label_: []const u8, client_random: []const u8, secret: []const u8) void {
     const builtin = @import("builtin");
     const native_os = builtin.os.tag;
-    const file_name: []const u8 = if (native_os == .windows)
-        return
-    else if (native_os == .wasi and !builtin.link_libc)
-        return
-    else
-        std.posix.getenv(key_log_file_env) orelse return;
-    fileAppend(file_name, label_, client_random, secret) catch return;
+    if (native_os == .wasi and !builtin.link_libc) return;
+    const file_name: []const u8 = if (native_os == .windows) blk: {
+        const val = std.process.getEnvVarOwned(std.heap.page_allocator, key_log_file_env) catch return;
+        break :blk val;
+    } else std.posix.getenv(key_log_file_env) orelse return;
+    defer if (native_os == .windows) std.heap.page_allocator.free(file_name);
+    fileAppend(file_name, label_, client_random, secret) catch |err| {
+        std.debug.print("key_log: write error: {}\n", .{err});
+    };
 }
 
 pub fn fileAppend(file_name: []const u8, label_: []const u8, client_random: []const u8, secret: []const u8) !void {
@@ -43,15 +45,18 @@ pub fn fileAppend(file_name: []const u8, label_: []const u8, client_random: []co
 }
 
 fn fileWrite(file_name: []const u8, line: []const u8) !void {
-    var file = try std.fs.createFileAbsolute(file_name, .{ .truncate = false });
+    const file = std.fs.openFileAbsolute(file_name, .{ .mode = .read_write }) catch blk: {
+        break :blk try std.fs.createFileAbsolute(file_name, .{});
+    };
     defer file.close();
-    const stat = try file.stat();
-    try file.seekTo(stat.size);
+    const end_pos = try file.getEndPos();
+    try file.seekTo(end_pos);
     try file.writeAll(line);
 }
 
 pub fn formatLine(buf: []u8, label_: []const u8, client_random: []const u8, secret: []const u8) ![]const u8 {
-    var w = std.Io.Writer.fixed(buf);
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
     try w.print("{s} ", .{label_});
     for (client_random) |b| {
         try w.print("{x:0>2}", .{b});
@@ -61,5 +66,5 @@ pub fn formatLine(buf: []u8, label_: []const u8, client_random: []const u8, secr
         try w.print("{x:0>2}", .{b});
     }
     try w.writeByte('\n');
-    return w.buffered();
+    return fbs.getWritten();
 }
