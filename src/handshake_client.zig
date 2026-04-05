@@ -296,7 +296,7 @@ pub const Handshake = struct {
     /// https://datatracker.ietf.org/doc/html/rfc5246#section-7.3
     /// https://datatracker.ietf.org/doc/html/rfc8446#section-2
     ///
-    pub fn handshake(h: *Self, opt: Options) !struct { Cipher, ?usize } {
+    pub fn handshake(h: *Self, opt: Options) !struct { Cipher, ?usize, ?Transcript } {
         var resumption_ticket: ?ResumptionTicket =
             if (opt.session_resumption) |r|
                 r.popTicket()
@@ -350,12 +350,25 @@ pub const Handshake = struct {
             try h.generateHandshakeCipher(opt.key_log_callback);
             try h.readEncryptedServerFlight1(resumption_ticket != null); // server flight 1
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
-            // Snapshot transcript for post-handshake auth (hash through server Finished)
-            const post_hs_transcript = h.transcript;
+            // Save client application traffic secret before makeClientFlight2 overwrites transcript buffer.
+            // Needed for post-handshake auth Finished (RFC 8446 §4.4 base key).
+            var client_app_secret: [48]u8 = undefined;
+            const secret_len: usize = @intCast(h.transcript.hashLength());
+            {
+                const app_secret = h.transcript.applicationSecret();
+                @memcpy(client_app_secret[0..secret_len], app_secret.client[0..secret_len]);
+            }
             try h.makeClientFlight2Tls13(opt.auth); // client flight 2
             log.debug("client_certificate_requested: {}", .{h.client_certificate_requested});
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
             try h.output.flush();
+
+            // Snapshot transcript AFTER client Finished for post-handshake auth (RFC 8446 §4.4).
+            // Handshake Context = ClientHello ... client Finished + CertificateRequest.
+            var post_hs_transcript = h.transcript;
+            // Replace finished key: post-handshake uses client_application_traffic_secret
+            // instead of client_handshake_traffic_secret (RFC 8446 §4.4).
+            post_hs_transcript.setPostHandshakeFinishedKey(client_app_secret[0..secret_len]);
 
             const secret_idx: ?usize = if (opt.session_resumption) |r|
                 try r.appendSecret(h.transcript.tag, h.transcript.resumptionSecret())

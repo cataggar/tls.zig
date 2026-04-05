@@ -126,6 +126,15 @@ pub const Transcript = struct {
         };
     }
 
+    /// Replace client_finished_key with one derived from the given secret.
+    /// Used for post-handshake authentication where the base key is
+    /// client_application_traffic_secret (RFC 8446 §4.4).
+    pub fn setPostHandshakeFinishedKey(t: *Transcript, secret: []const u8) void {
+        switch (t.tag) {
+            inline else => |h| @field(t, @tagName(h)).setPostHandshakeFinishedKey(secret),
+        }
+    }
+
     pub fn serverFinishedTls13(t: *Transcript) []const u8 {
         return switch (t.tag) {
             inline else => |h| @field(t, @tagName(h)).serverFinishedTls13(),
@@ -371,6 +380,10 @@ fn TranscriptT(comptime Hash: type) type {
             const expanded = hkdfExpandLabel(Hkdf, prk, "finished", "", hash_length);
             Hmac.create(self.buffer[0..hash_length], &self.hash.peek(), &expanded);
             return self.buffer[0..hash_length];
+        }
+
+        fn setPostHandshakeFinishedKey(self: *Self, secret: []const u8) void {
+            self.client_finished_key = hkdfExpandLabel(Hkdf, secret[0..hash_length].*, "finished", "", hash_length);
         }
 
         fn serverFinishedTls13(self: *Self) []const u8 {

@@ -105,37 +105,42 @@ pub const Connection = struct {
             switch (content_type) {
                 .application_data => {},
                 .handshake => {
-                    const handshake_type: proto.Handshake = @enumFromInt(cleartext[0]);
-                    switch (handshake_type) {
-                        .new_session_ticket => {
-                            if (c.session_resumption) |r| {
-                                r.pushTicket(cleartext, c.session_resumption_secret_idx.?) catch {};
-                            }
-                            continue;
-                        },
-                        .key_update => {
-                            if (cleartext.len != 5) return error.TlsDecodeError;
-                            // rfc: Upon receiving a KeyUpdate, the receiver MUST
-                            // update its receiving keys.
-                            try c.cipher.keyUpdateDecrypt();
-                            const key: proto.KeyUpdateRequest = @enumFromInt(cleartext[4]);
-                            switch (key) {
-                                .update_requested => {
-                                    @atomicStore(bool, &c.key_update_requested, true, .monotonic);
-                                },
-                                .update_not_requested => {},
-                                else => return error.TlsIllegalParameter,
-                            }
-                            // this record is handled read next
-                            continue;
-                        },
-                        .certificate_request => {
-                            // Post-handshake client authentication (RFC 8446 Section 4.6.2)
-                            try c.handlePostHandshakeAuth(cleartext);
-                            continue;
-                        },
-                        else => {},
+                    // Process all handshake messages in this record (may contain multiple)
+                    var hs_off: usize = 0;
+                    while (hs_off < cleartext.len) {
+                        if (hs_off + 4 > cleartext.len) break;
+                        const hs_type: proto.Handshake = @enumFromInt(cleartext[hs_off]);
+                        const hs_len = std.mem.readInt(u24, cleartext[hs_off + 1 ..][0..3], .big);
+                        const hs_total = 4 + hs_len;
+                        if (hs_off + hs_total > cleartext.len) break;
+                        const hs_msg = cleartext[hs_off .. hs_off + hs_total];
+
+                        switch (hs_type) {
+                            .new_session_ticket => {
+                                if (c.session_resumption) |r| {
+                                    r.pushTicket(hs_msg, c.session_resumption_secret_idx.?) catch {};
+                                }
+                            },
+                            .key_update => {
+                                if (hs_msg.len != 5) return error.TlsDecodeError;
+                                try c.cipher.keyUpdateDecrypt();
+                                const key: proto.KeyUpdateRequest = @enumFromInt(hs_msg[4]);
+                                switch (key) {
+                                    .update_requested => {
+                                        @atomicStore(bool, &c.key_update_requested, true, .monotonic);
+                                    },
+                                    .update_not_requested => {},
+                                    else => return error.TlsIllegalParameter,
+                                }
+                            },
+                            .certificate_request => {
+                                try c.handlePostHandshakeAuth(hs_msg);
+                            },
+                            else => {},
+                        }
+                        hs_off += hs_total;
                     }
+                    continue;
                 },
                 .alert => {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
@@ -159,37 +164,58 @@ pub const Connection = struct {
         try c.writeRecord(.alert, &proto.Alert.closeNotify());
     }
 
-    /// Handle post-handshake CertificateRequest by sending Certificate + CertificateVerify.
+    /// Handle post-handshake CertificateRequest by sending Certificate + CertificateVerify + Finished.
+    /// RFC 8446 Section 4.6.2.
     fn handlePostHandshakeAuth(c: *Self, cert_request: []const u8) !void {
         log.debug("handlePostHandshakeAuth: cert_request={d} bytes, auth={}, transcript={}", .{
-            cert_request.len,
-            c.auth != null,
-            c.transcript != null,
+            cert_request.len, c.auth != null, c.transcript != null,
         });
 
         const auth = c.auth orelse {
-            log.debug("handlePostHandshakeAuth: no auth, sending empty cert", .{});
-            var cert_msg: [12]u8 = undefined;
-            cert_msg[0] = @intFromEnum(proto.Handshake.certificate);
-            cert_msg[1] = 0;
-            cert_msg[2] = 0;
-            cert_msg[3] = 4;
-            cert_msg[4] = 0;
-            cert_msg[5] = 0;
-            cert_msg[6] = 0;
-            cert_msg[7] = 0;
-            try c.encryptWrite(.handshake, cert_msg[0..8]);
+            log.debug("handlePostHandshakeAuth: no auth, sending empty cert + finished", .{});
+            var transcript = c.transcript orelse return;
+            transcript.update(cert_request);
+            // Empty Certificate with request context
+            const ctx_len_byte: u8 = if (cert_request.len > 4) cert_request[4] else 0;
+            var empty_cert_buf: [128]u8 = undefined;
+            var empty_w = record.Writer.init(&empty_cert_buf);
+            // certificate_request_context_len(1) + context(N) + certificate_list_len(3) = 4 + N
+            empty_w.handshakeRecordHeader(.certificate, 1 + ctx_len_byte + 3) catch return;
+            empty_w.byte(ctx_len_byte) catch return;
+            if (ctx_len_byte > 0 and cert_request.len > 5 + ctx_len_byte)
+                empty_w.slice(cert_request[5 .. 5 + ctx_len_byte]) catch return;
+            empty_w.int(u24, 0) catch return;
+            const empty_cert_msg = empty_w.buffered();
+            transcript.update(empty_cert_msg);
+            try c.encryptWrite(.handshake, empty_cert_msg);
+            // Finished (required even when declining auth, per RFC 8446 §4.6.2)
+            var fin_buf: [128]u8 = undefined;
+            var fin_w = record.Writer.init(&fin_buf);
+            fin_w.handshakeRecord(.finished, transcript.clientFinishedTls13()) catch return;
+            const fin_msg = fin_w.buffered();
+            transcript.update(fin_msg);
+            try c.encryptWrite(.handshake, fin_msg);
+            c.transcript = transcript;
             return;
         };
 
         var transcript = c.transcript orelse return;
         transcript.update(cert_request);
 
+        // Extract certificate_request_context from CertificateRequest
+        // Format: handshake_type(1) + length(3) + context_len(1) + context(N) + extensions
+        const ctx_len: usize = if (cert_request.len > 4) cert_request[4] else 0;
+        const ctx = if (ctx_len > 0 and cert_request.len > 5 + ctx_len)
+            cert_request[5 .. 5 + ctx_len]
+        else
+            &[_]u8{};
+
         const cb = common.CertificateBuilder{
             .cert_key_pair = auth,
             .transcript = &transcript,
             .tls_version = .tls_1_3,
             .side = .client,
+            .certificate_request_context = ctx,
         };
 
         var cert_buf: [4096]u8 = undefined;
@@ -216,8 +242,20 @@ pub const Connection = struct {
         transcript.update(cv_msg);
         try c.encryptWrite(.handshake, cv_msg);
 
+        // Finished (RFC 8446 §4.6.2 requires Certificate + CertificateVerify + Finished)
+        var fin_buf: [128]u8 = undefined;
+        var fin_w = record.Writer.init(&fin_buf);
+        fin_w.handshakeRecord(.finished, transcript.clientFinishedTls13()) catch |err| {
+            log.debug("handlePostHandshakeAuth: Finished build failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const fin_msg = fin_w.buffered();
+        log.debug("handlePostHandshakeAuth: Finished={d} bytes", .{fin_msg.len});
+        transcript.update(fin_msg);
+        try c.encryptWrite(.handshake, fin_msg);
+
         c.transcript = transcript;
-        log.debug("handlePostHandshakeAuth: sent Certificate + CertificateVerify", .{});
+        log.debug("handlePostHandshakeAuth: sent Certificate + CertificateVerify + Finished", .{});
     }
 
     // write/read
