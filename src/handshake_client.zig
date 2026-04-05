@@ -350,6 +350,8 @@ pub const Handshake = struct {
             try h.generateHandshakeCipher(opt.key_log_callback);
             try h.readEncryptedServerFlight1(resumption_ticket != null); // server flight 1
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
+            // Snapshot transcript for post-handshake auth (hash through server Finished)
+            const post_hs_transcript = h.transcript;
             try h.makeClientFlight2Tls13(opt.auth); // client flight 2
             log.debug("client_certificate_requested: {}", .{h.client_certificate_requested});
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
@@ -360,7 +362,7 @@ pub const Handshake = struct {
             else
                 null;
 
-            return .{ app_cipher, secret_idx };
+            return .{ app_cipher, secret_idx, post_hs_transcript };
         }
 
         // tls 1.2 specific handshake part
@@ -369,7 +371,7 @@ pub const Handshake = struct {
         h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
         try h.output.flush();
         try h.readServerFlight2(); // server flight 2
-        return .{ h.cipher, null };
+        return .{ h.cipher, null, null };
     }
 
     fn clientFlight1(h: *Self, opt: Options) !void {

@@ -33,15 +33,15 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, opt: config.Client) !Connec
     assert(output.buffer.len >= 2048); // client hello requires: 1572 + opt.host.len
 
     var hc: handshake.Client = .{ .input = input, .output = output };
-    const cipher, const session_resumption_secret_idx = try hc.handshake(opt);
+    const cipher_val, const session_resumption_secret_idx, const post_hs_transcript = try hc.handshake(opt);
     return .{
-        .cipher = cipher,
+        .cipher = cipher_val,
         .input = input,
         .output = output,
         .session_resumption_secret_idx = session_resumption_secret_idx,
         .session_resumption = opt.session_resumption,
         .auth = opt.auth,
-        .transcript = hc.transcript,
+        .transcript = post_hs_transcript,
     };
 }
 

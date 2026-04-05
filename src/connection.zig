@@ -161,15 +161,19 @@ pub const Connection = struct {
 
     /// Handle post-handshake CertificateRequest by sending Certificate + CertificateVerify.
     fn handlePostHandshakeAuth(c: *Self, cert_request: []const u8) !void {
+        log.debug("handlePostHandshakeAuth: cert_request={d} bytes, auth={}, transcript={}", .{
+            cert_request.len,
+            c.auth != null,
+            c.transcript != null,
+        });
+
         const auth = c.auth orelse {
-            // No client cert configured — send empty certificate
+            log.debug("handlePostHandshakeAuth: no auth, sending empty cert", .{});
             var cert_msg: [12]u8 = undefined;
-            // Handshake header: type=certificate(11), length=4
             cert_msg[0] = @intFromEnum(proto.Handshake.certificate);
             cert_msg[1] = 0;
             cert_msg[2] = 0;
             cert_msg[3] = 4;
-            // request_context length=0, certificate_list length=0
             cert_msg[4] = 0;
             cert_msg[5] = 0;
             cert_msg[6] = 0;
@@ -179,7 +183,6 @@ pub const Connection = struct {
         };
 
         var transcript = c.transcript orelse return;
-        // Update transcript with the CertificateRequest
         transcript.update(cert_request);
 
         const cb = common.CertificateBuilder{
@@ -189,34 +192,32 @@ pub const Connection = struct {
             .side = .client,
         };
 
-        // Build Certificate message
         var cert_buf: [4096]u8 = undefined;
         var cert_w = record.Writer.init(&cert_buf);
-        cb.makeCertificate(&cert_w) catch return;
+        cb.makeCertificate(&cert_w) catch |err| {
+            log.debug("handlePostHandshakeAuth: makeCertificate failed: {s}", .{@errorName(err)});
+            return;
+        };
         const cert_msg = cert_w.buffered();
+        log.debug("handlePostHandshakeAuth: Certificate={d} bytes", .{cert_msg.len});
 
-        // Update transcript with Certificate
         transcript.update(cert_msg);
-
-        // Send encrypted Certificate
         try c.encryptWrite(.handshake, cert_msg);
 
-        // Build CertificateVerify message
         var cv_buf: [1024]u8 = undefined;
         var cv_w = record.Writer.init(&cv_buf);
-        cb.makeCertificateVerify(&cv_w) catch return;
+        cb.makeCertificateVerify(&cv_w) catch |err| {
+            log.debug("handlePostHandshakeAuth: makeCertificateVerify failed: {s}", .{@errorName(err)});
+            return;
+        };
         const cv_msg = cv_w.buffered();
+        log.debug("handlePostHandshakeAuth: CertificateVerify={d} bytes", .{cv_msg.len});
 
-        // Update transcript with CertificateVerify
         transcript.update(cv_msg);
-
-        // Send encrypted CertificateVerify
         try c.encryptWrite(.handshake, cv_msg);
 
-        // Save updated transcript back
         c.transcript = transcript;
-
-        log.debug("post-handshake auth: sent Certificate + CertificateVerify", .{});
+        log.debug("handlePostHandshakeAuth: sent Certificate + CertificateVerify", .{});
     }
 
     // write/read
