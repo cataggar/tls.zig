@@ -67,6 +67,10 @@ pub const Options = struct {
 
     session_resumption: ?*SessionResumption = null,
 
+    /// ALPN protocol names to send in ClientHello.
+    /// Default sends "http/1.1" which is required by many HTTP servers.
+    alpn_protocols: []const []const u8 = &.{"http/1.1"},
+
     pub const Diagnostic = struct {
         tls_version: proto.Version = @enumFromInt(0),
         cipher_suite_tag: CipherSuite = @enumFromInt(0),
@@ -309,6 +313,24 @@ pub const Handshake = struct {
 
         try h.makeClientHello(opt, resumption_ticket); // client flight 1
         h.max_client_record_len = h.output.end;
+        // Debug: dump ClientHello bytes
+        {
+            const ch = h.output.buffer[0..h.output.end];
+            log.debug("ClientHello: {d} bytes", .{ch.len});
+            for (0..(ch.len + 15) / 16) |blk| {
+                const start = blk * 16;
+                const end = @min(start + 16, ch.len);
+                var hex_buf: [48]u8 = undefined;
+                var hex_pos: usize = 0;
+                for (ch[start..end]) |b| {
+                    hex_buf[hex_pos] = "0123456789abcdef"[b >> 4];
+                    hex_buf[hex_pos + 1] = "0123456789abcdef"[b & 0xf];
+                    hex_buf[hex_pos + 2] = ' ';
+                    hex_pos += 3;
+                }
+                log.debug("  {d:0>4}: {s}", .{ start, hex_buf[0..hex_pos] });
+            }
+        }
         try h.output.flush();
 
         try h.readServerFlight1(); // server flight 1
@@ -329,6 +351,7 @@ pub const Handshake = struct {
             try h.readEncryptedServerFlight1(resumption_ticket != null); // server flight 1
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth); // client flight 2
+            log.debug("client_certificate_requested: {}", .{h.client_certificate_requested});
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
             try h.output.flush();
 
@@ -457,6 +480,13 @@ pub const Handshake = struct {
         try w.extension(.supported_groups, opt.named_groups);
         try w.keyShare(opt.named_groups, shared_keys);
         try w.serverName(opt.host);
+        if (opt.alpn_protocols.len > 0) try w.alpn(opt.alpn_protocols);
+        // Signal client authentication capability
+        if (opt.auth != null) {
+            // post_handshake_auth extension (type 49, empty)
+            try w.enumValue(proto.Extension.post_handshake_auth);
+            try w.int(u16, 0);
+        }
         // binder key placeholder
         const binder_pos: ?usize = if (resumption_ticket) |ticket| brk: {
             // Add pre shared key extension if this is session resumption. Must be last extension.
