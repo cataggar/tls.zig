@@ -40,6 +40,8 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, opt: config.Client) !Connec
         .output = output,
         .session_resumption_secret_idx = session_resumption_secret_idx,
         .session_resumption = opt.session_resumption,
+        .auth = opt.auth,
+        .transcript = hc.transcript,
     };
 }
 

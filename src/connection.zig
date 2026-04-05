@@ -10,6 +10,9 @@ const Record = record.Record;
 const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 const SessionResumption = @import("handshake_client.zig").Options.SessionResumption;
+const common = @import("handshake_common.zig");
+const CertKeyPair = common.CertKeyPair;
+const transcript_mod = @import("transcript.zig");
 
 const log = std.log.scoped(.tls);
 
@@ -27,6 +30,10 @@ pub const Connection = struct {
 
     session_resumption: ?*SessionResumption = null,
     session_resumption_secret_idx: ?usize = null,
+
+    /// For post-handshake client authentication (TLS 1.3 Section 4.6.2)
+    auth: ?*CertKeyPair = null,
+    transcript: ?transcript_mod.Transcript = null,
 
     const Self = @This();
 
@@ -122,6 +129,11 @@ pub const Connection = struct {
                             // this record is handled read next
                             continue;
                         },
+                        .certificate_request => {
+                            // Post-handshake client authentication (RFC 8446 Section 4.6.2)
+                            try c.handlePostHandshakeAuth(cleartext);
+                            continue;
+                        },
                         else => {},
                     }
                 },
@@ -145,6 +157,66 @@ pub const Connection = struct {
     pub fn close(c: *Self) anyerror!void {
         if (c.received_close_notify) return;
         try c.writeRecord(.alert, &proto.Alert.closeNotify());
+    }
+
+    /// Handle post-handshake CertificateRequest by sending Certificate + CertificateVerify.
+    fn handlePostHandshakeAuth(c: *Self, cert_request: []const u8) !void {
+        const auth = c.auth orelse {
+            // No client cert configured — send empty certificate
+            var cert_msg: [12]u8 = undefined;
+            // Handshake header: type=certificate(11), length=4
+            cert_msg[0] = @intFromEnum(proto.Handshake.certificate);
+            cert_msg[1] = 0;
+            cert_msg[2] = 0;
+            cert_msg[3] = 4;
+            // request_context length=0, certificate_list length=0
+            cert_msg[4] = 0;
+            cert_msg[5] = 0;
+            cert_msg[6] = 0;
+            cert_msg[7] = 0;
+            try c.encryptWrite(.handshake, cert_msg[0..8]);
+            return;
+        };
+
+        var transcript = c.transcript orelse return;
+        // Update transcript with the CertificateRequest
+        transcript.update(cert_request);
+
+        const cb = common.CertificateBuilder{
+            .cert_key_pair = auth,
+            .transcript = &transcript,
+            .tls_version = .tls_1_3,
+            .side = .client,
+        };
+
+        // Build Certificate message
+        var cert_buf: [4096]u8 = undefined;
+        var cert_w = record.Writer.init(&cert_buf);
+        cb.makeCertificate(&cert_w) catch return;
+        const cert_msg = cert_w.buffered();
+
+        // Update transcript with Certificate
+        transcript.update(cert_msg);
+
+        // Send encrypted Certificate
+        try c.encryptWrite(.handshake, cert_msg);
+
+        // Build CertificateVerify message
+        var cv_buf: [1024]u8 = undefined;
+        var cv_w = record.Writer.init(&cv_buf);
+        cb.makeCertificateVerify(&cv_w) catch return;
+        const cv_msg = cv_w.buffered();
+
+        // Update transcript with CertificateVerify
+        transcript.update(cv_msg);
+
+        // Send encrypted CertificateVerify
+        try c.encryptWrite(.handshake, cv_msg);
+
+        // Save updated transcript back
+        c.transcript = transcript;
+
+        log.debug("post-handshake auth: sent Certificate + CertificateVerify", .{});
     }
 
     // write/read
