@@ -218,7 +218,7 @@ pub const Connection = struct {
             .certificate_request_context = ctx,
         };
 
-        var cert_buf: [4096]u8 = undefined;
+        var cert_buf: [16384]u8 = undefined;
         var cert_w = record.Writer.init(&cert_buf);
         cb.makeCertificate(&cert_w) catch |err| {
             log.debug("handlePostHandshakeAuth: makeCertificate failed: {s}", .{@errorName(err)});
