@@ -243,6 +243,8 @@ pub const Handshake = struct {
     post_handshake_transcript: ?Transcript = null,
     post_handshake_auth_advertised: bool = false,
     status_request_advertised: bool = false,
+    extended_master_secret_advertised: bool = false,
+    extended_master_secret_negotiated: bool = false,
     client_application_traffic_secret: [64]u8 = undefined,
     client_application_traffic_secret_len: usize = 0,
     // statistics
@@ -366,8 +368,7 @@ pub const Handshake = struct {
         }
 
         // tls 1.2 specific handshake part
-        try h.generateCipher(opt.key_log_callback, opt.rng);
-        try h.makeClientFlight2Tls12(opt.auth, opt.rng); // client flight 2
+        try h.makeClientFlight2Tls12(opt.auth, opt.rng, opt.key_log_callback); // client flight 2
         h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
         try h.output.flush();
         try h.readServerFlight2(); // server flight 2
@@ -395,8 +396,7 @@ pub const Handshake = struct {
             h.cipher = app_cipher;
         } else {
             // tls 1.2 specific handshake part
-            try h.generateCipher(opt.key_log_callback, opt.rng);
-            try h.makeClientFlight2Tls12(opt.auth, opt.rng);
+            try h.makeClientFlight2Tls12(opt.auth, opt.rng, opt.key_log_callback);
         }
     }
 
@@ -407,7 +407,6 @@ pub const Handshake = struct {
 
     /// Prepare key material and generate cipher for TLS 1.2
     fn generateCipher(h: *Self, key_log_callback: ?key_log.Callback, rng: std.Random) !void {
-        try h.verifyCertificateSignatureTls12();
         try h.generateKeyMaterial(key_log_callback);
         h.cipher = try Cipher.initTls12(h.cipher_suite, &h.key_material, .client, rng);
     }
@@ -419,7 +418,11 @@ pub const Handshake = struct {
         else
             &h.rsa_secret.secret;
 
-        h.transcript.masterSecret(&h.master_secret, pre_master_secret, h.client_random, h.server_random);
+        if (h.extended_master_secret_negotiated) {
+            h.transcript.extendedMasterSecret(&h.master_secret, pre_master_secret);
+        } else {
+            h.transcript.masterSecret(&h.master_secret, pre_master_secret, h.client_random, h.server_random);
+        }
         h.transcript.keyMaterial(&h.key_material, &h.master_secret, h.client_random, h.server_random);
 
         if (key_log_callback) |cb| {
@@ -469,6 +472,8 @@ pub const Handshake = struct {
     fn makeClientHello(h: *Self, opt: Options, resumption_ticket: ?ResumptionTicket) !void {
         h.post_handshake_auth_advertised = false;
         h.status_request_advertised = false;
+        h.extended_master_secret_advertised = false;
+        h.extended_master_secret_negotiated = false;
 
         // Prepare data
         const tls_versions = try CipherSuite.versions(opt.cipher_suites);
@@ -504,6 +509,10 @@ pub const Handshake = struct {
         }
         try w.statusRequest();
         h.status_request_advertised = true;
+        if (tls_versions != .tls_1_3) {
+            try w.emptyExtension(.extended_master_secret);
+            h.extended_master_secret_advertised = true;
+        }
         if (tls_versions != .tls_1_2) {
             try w.extension(.supported_versions, supported_versions);
         }
@@ -527,7 +536,6 @@ pub const Handshake = struct {
         if (tls_versions != .tls_1_2) {
             try w.emptyExtension(.post_handshake_auth);
             h.post_handshake_auth_advertised = true;
-            try w.emptyExtension(.extended_master_secret);
             try w.emptyRenegotiationInfo();
             if (resumption_ticket == null) {
                 try w.extension(.psk_key_exchange_modes, &[_]proto.KeyExchangeModes{.psk_dhe_ke});
@@ -644,6 +652,7 @@ pub const Handshake = struct {
 
     /// Parse server hello message.
     fn parseServerHello(h: *Self, d: *record.Decoder, length: u24) !void {
+        h.extended_master_secret_negotiated = false;
         if (try d.decode(proto.Version) != proto.Version.tls_1_2)
             return error.TlsBadVersion;
         h.server_random = try d.array(32);
@@ -693,12 +702,19 @@ pub const Handshake = struct {
                     .pre_shared_key => {
                         h.pre_shared_selected_identity = try d.decode(u16);
                     },
+                    .extended_master_secret => {
+                        if (len != 0) return error.TlsIllegalParameter;
+                        if (!h.extended_master_secret_advertised) return error.TlsUnsupportedExtension;
+                        h.extended_master_secret_negotiated = true;
+                    },
                     else => {
                         try d.skip(len);
                     },
                 }
             }
         }
+        if (h.extended_master_secret_negotiated and h.tls_version != .tls_1_2)
+            return error.TlsUnsupportedExtension;
     }
 
     fn isServerHelloRetryRequest(server_random: []const u8) bool {
@@ -866,7 +882,14 @@ pub const Handshake = struct {
     /// finished messages for tls 1.2.
     /// If client certificate is requested also adds client certificate and
     /// certificate verify messages.
-    fn makeClientFlight2Tls12(h: *Self, auth: ?*CertKeyPair, rng: std.Random) !void {
+    fn makeClientFlight2Tls12(
+        h: *Self,
+        auth: ?*CertKeyPair,
+        rng: std.Random,
+        key_log_callback: ?key_log.Callback,
+    ) !void {
+        try h.verifyCertificateSignatureTls12();
+
         var w: record.Writer = .initFromIo(h.output);
         var cert_builder: ?CertificateBuilder = null;
 
@@ -904,6 +927,8 @@ pub const Handshake = struct {
             h.transcript.update(hw.buffered());
             try w.record(.handshake, hw.buffered());
         }
+
+        try h.generateCipher(key_log_callback, rng);
 
         // Client certificate verify
         if (cert_builder) |cb| {
@@ -1058,6 +1083,19 @@ const data12 = @import("testdata/tls12.zig");
 const data13 = @import("testdata/tls13.zig");
 const testu = @import("testu.zig");
 
+fn serverHelloWithExtraExtension(comptime extension_hex: []const u8) [data12.server_hello.len + testu.hexToBytes(extension_hex).len]u8 {
+    const extension = testu.hexToBytes(extension_hex);
+    var server_hello: [data12.server_hello.len + extension.len]u8 = undefined;
+
+    @memcpy(server_hello[0..data12.server_hello.len], &data12.server_hello);
+    @memcpy(server_hello[data12.server_hello.len..], &extension);
+    std.mem.writeInt(u16, server_hello[3..5], std.mem.readInt(u16, data12.server_hello[3..5], .big) + extension.len, .big);
+    std.mem.writeInt(u24, server_hello[6..9], std.mem.readInt(u24, data12.server_hello[6..9], .big) + extension.len, .big);
+    std.mem.writeInt(u16, server_hello[47..49], std.mem.readInt(u16, data12.server_hello[47..49], .big) + extension.len, .big);
+
+    return server_hello;
+}
+
 test "parse tls 1.2 server hello" {
     var buffer: [1024]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
@@ -1088,6 +1126,106 @@ test "parse tls 1.2 server hello" {
     try h.generateKeyMaterial(null);
 
     try testing.expectEqualSlices(u8, &data12.key_material, h.key_material[0..data12.key_material.len]);
+}
+
+test "parse tls 1.2 server hello negotiates extended master secret" {
+    const server_hello = serverHelloWithExtraExtension("00 17 00 00");
+    var reader: Io.Reader = .fixed(&server_hello);
+    var d = try Record.decoder(&reader);
+
+    try testing.expectEqual(.server_hello, try d.decode(proto.Handshake));
+    const length = try d.decode(u24);
+
+    var h: Handshake = .{
+        .output = undefined,
+        .input = undefined,
+        .extended_master_secret_advertised = true,
+    };
+    try h.parseServerHello(&d, length);
+
+    try testing.expect(h.extended_master_secret_negotiated);
+    try testing.expectEqual(.tls_1_2, h.tls_version);
+}
+
+test "parse tls 1.2 server hello rejects malformed extended master secret" {
+    const server_hello = serverHelloWithExtraExtension("00 17 00 01 00");
+    var reader: Io.Reader = .fixed(&server_hello);
+    var d = try Record.decoder(&reader);
+
+    try testing.expectEqual(.server_hello, try d.decode(proto.Handshake));
+    const length = try d.decode(u24);
+
+    var h: Handshake = .{
+        .output = undefined,
+        .input = undefined,
+        .extended_master_secret_advertised = true,
+    };
+    try testing.expectError(error.TlsIllegalParameter, h.parseServerHello(&d, length));
+}
+
+test "tls 1.2 extended master secret uses session hash" {
+    const expected_master_secret = testu.hexToBytes(
+        \\ 96 01 43 e1 bc 08 95 e7 2b 36 0f 49 c9 11 32 e4
+        \\ 40 b1 e3 05 9e 6d f2 dd 89 4f fc 61 66 d7 67 c6
+        \\ 32 9b f5 b7 6d 38 3a 24 95 5d bf 03 81 78 e4 b0
+    );
+
+    var h: Handshake = .{
+        .output = undefined,
+        .input = undefined,
+        .client_random = data12.client_random,
+        .server_random = data12.server_random,
+        .cipher_suite = .ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        .named_group = .x25519,
+        .server_pub_key = &data12.server_pub_key,
+        .extended_master_secret_negotiated = true,
+    };
+    h.dh_kp.x25519_kp.secret_key = data12.client_secret;
+    h.transcript.use(h.cipher_suite.hash());
+
+    for (data12.handshake_messages) |msg| {
+        h.transcript.update(msg[record.header_len..]);
+    }
+
+    try h.generateKeyMaterial(null);
+    try testing.expectEqualSlices(u8, &expected_master_secret, &h.master_secret);
+    try testing.expect(!mem.eql(u8, &data12.master_secret, &h.master_secret));
+}
+
+test "tls 1.2 client flight derives extended master secret after client key exchange" {
+    const expected_master_secret = testu.hexToBytes(
+        \\ cf 5f e6 38 4b fb d9 6f 5b 9e f1 18 27 1a 93 2a
+        \\ 86 f9 d1 49 7f ce 31 25 b8 aa e0 2c e2 99 76 44
+        \\ 1d 80 b1 31 b2 f4 f0 bf 19 69 2a 83 f5 ab 28 6b
+    );
+    const server_hello = serverHelloWithExtraExtension("00 17 00 00");
+    const server_hello_responses = server_hello ++
+        data12.server_certificate ++ data12.server_key_exchange ++ data12.server_hello_done;
+
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var reader: Io.Reader = .fixed(&server_hello_responses);
+    var h: Handshake = .{
+        .output = &writer,
+        .input = &reader,
+        .client_random = data12.client_random,
+        .extended_master_secret_advertised = true,
+    };
+    h.dh_kp.x25519_kp = .{
+        .secret_key = data12.client_secret,
+        .public_key = data12.client_key_exchange_for_transcript[record.header_len + 5 ..][0..32].*,
+    };
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .empty, .now_sec = 0 };
+    h.transcript.update(data12.client_hello[record.header_len..]);
+
+    try h.readServerFlight1();
+    h.transcript.use(h.cipher_suite.hash());
+    try testing.expect(h.extended_master_secret_negotiated);
+
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    try h.makeClientFlight2Tls12(null, rng_impl.interface(), null);
+
+    try testing.expectEqualSlices(u8, &expected_master_secret, &h.master_secret);
 }
 
 test "tls 1.2 accepts certificate status when advertised" {
@@ -1343,16 +1481,17 @@ test "tls 1.3 certificate status extension is ignored" {
 
 test "create client hello" {
     const expected = testu.hexToBytes(
-        "16 03 03 00 82 " ++ // record header
-            "01 00 00 7e " ++ // handshake header
+        "16 03 03 00 86 " ++ // record header
+            "01 00 00 82 " ++ // handshake header
             "03 03 " ++ // protocol version
             "00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f " ++ // client random
             "00 " ++ // no session id
             "00 02 c0 2b " ++ // cipher suites
             "01 00 " ++ // compression methods
-            "00 53 " ++ // extensions length
+            "00 57 " ++ // extensions length
             "ff 01 00 01 00 " ++ // renegotiation_info extension
             "00 05 00 05 01 00 00 00 00 " ++ // status_request extension
+            "00 17 00 00 " ++ // extended master secret extension
             "00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01 " ++ // signature algorithms extension
             "00 0a 00 08 00 06 00 1d 00 17 00 18 " ++ // named groups extension
             "00 0b 00 02 01 00 " ++ // EC point formats extension
@@ -1385,8 +1524,8 @@ test "create client hello" {
 
     const actual = h.output.buffered();
     try testing.expectEqualSlices(u8, &expected, actual);
-    try testing.expectEqual(131, h.output.unusedCapacityLen());
-    try testing.expectEqual(135, expected.len);
+    try testing.expectEqual(127, h.output.unusedCapacityLen());
+    try testing.expectEqual(139, expected.len);
 }
 
 test "client hello advertises status request" {
@@ -1460,6 +1599,85 @@ test "client hello advertises secure renegotiation for tls 1.2 only clients" {
 
     const ext = testu.hexToBytes("ff 01 00 01 00");
     try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+}
+
+test "client hello advertises extended master secret for tls 1.2 only clients" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 17 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+    try testing.expect(h.extended_master_secret_advertised);
+}
+
+test "client hello advertises extended master secret for mixed tls 1.3 and tls 1.2 clients" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{
+            CipherSuite.AES_256_GCM_SHA384,
+            CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        },
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 17 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+    try testing.expect(h.extended_master_secret_advertised);
+}
+
+test "client hello omits extended master secret for tls 1.3 only clients" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+        .extended_master_secret_advertised = true,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 17 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) == null);
+    try testing.expect(!h.extended_master_secret_advertised);
 }
 
 test "client hello advertises post-handshake auth with client cert" {
@@ -1747,14 +1965,14 @@ test "nonblock handshake" {
     }
 
     const expected_client_flight_1 = testu.hexToBytes(
-        \\ 16 03 03 00 c2
-        \\ 01 00 00 be
+        \\ 16 03 03 00 be
+        \\ 01 00 00 ba
         \\ 03 03
         \\ 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
         \\ 00
         \\ 00 02 13 02
         \\ 01 00
-        \\ 00 93
+        \\ 00 8f
         \\ 00 05 00 05 01 00 00 00 00
         \\ 00 2b 00 03 02 03 04
         \\ 00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01
@@ -1765,7 +1983,6 @@ test "nonblock handshake" {
         \\ 35 80 72 d6 36 58 80 d1 ae ea 32 9a df 91 21 38 38 51 ed 21 a2 8e 3b 75 e9 65 d0 d2 cd 16 62 54
         \\ 00 00 00 18 00 16 00 00 13 65 78 61 6d 70 6c 65 2e 75 6c 66 68 65 69 6d 2e 6e 65 74
         \\ 00 31 00 00
-        \\ 00 17 00 00
         \\ ff 01 00 01 00
         \\ 00 2d 00 02 01 01
     );
