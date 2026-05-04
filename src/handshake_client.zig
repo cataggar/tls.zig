@@ -242,6 +242,7 @@ pub const Handshake = struct {
     /// Transcript snapshot used as the base for TLS 1.3 post-handshake auth.
     post_handshake_transcript: ?Transcript = null,
     post_handshake_auth_advertised: bool = false,
+    status_request_advertised: bool = false,
     client_application_traffic_secret: [64]u8 = undefined,
     client_application_traffic_secret_len: usize = 0,
     // statistics
@@ -467,6 +468,7 @@ pub const Handshake = struct {
 
     fn makeClientHello(h: *Self, opt: Options, resumption_ticket: ?ResumptionTicket) !void {
         h.post_handshake_auth_advertised = false;
+        h.status_request_advertised = false;
 
         // Prepare data
         const tls_versions = try CipherSuite.versions(opt.cipher_suites);
@@ -500,8 +502,9 @@ pub const Handshake = struct {
         if (tls_versions == .tls_1_2) {
             try w.emptyRenegotiationInfo();
         }
+        try w.statusRequest();
+        h.status_request_advertised = true;
         if (tls_versions != .tls_1_2) {
-            try w.statusRequest();
             try w.extension(.supported_versions, supported_versions);
         }
         try w.extension(.signature_algorithms, common.supported_signature_algorithms);
@@ -604,6 +607,18 @@ pub const Handshake = struct {
                     .certificate => {
                         try h.cert.parseCertificate(&d, h.tls_version);
                         handshake_states = if (h.cipher_suite.keyExchange() == .rsa)
+                            if (h.status_request_advertised)
+                                &.{ .certificate_status, .server_hello_done }
+                            else
+                                &.{.server_hello_done}
+                        else if (h.status_request_advertised)
+                            &.{ .certificate_status, .server_key_exchange }
+                        else
+                            &.{.server_key_exchange};
+                    },
+                    .certificate_status => {
+                        try parseCertificateStatus(&d, length);
+                        handshake_states = if (h.cipher_suite.keyExchange() == .rsa)
                             &.{.server_hello_done}
                         else
                             &.{.server_key_exchange};
@@ -702,6 +717,20 @@ pub const Handshake = struct {
         h.cert.signature_scheme = try d.decode(proto.SignatureScheme);
         h.cert.signature = try common.dupe(&h.cert.signature_buf, try d.slice(try d.decode(u16)));
         if (curve_type != .named_curve) return error.TlsIllegalParameter;
+    }
+
+    fn parseCertificateStatus(d: *record.Decoder, length: u24) !void {
+        if (length < 4) return error.TlsDecodeError;
+        const end = d.idx + @as(usize, length);
+        if (end > d.payload.len) return error.TlsDecodeError;
+
+        const status_type = try d.decode(u8);
+        if (status_type != 1) return error.TlsBadCertificateStatusResponse;
+
+        const response_len = try d.decode(u24);
+        if (response_len == 0) return error.TlsBadCertificateStatusResponse;
+        if (response_len != end - d.idx) return error.TlsDecodeError;
+        try d.skip(response_len);
     }
 
     /// Read encrypted part (after server hello) of the server first flight
@@ -1061,6 +1090,59 @@ test "parse tls 1.2 server hello" {
     try testing.expectEqualSlices(u8, &data12.key_material, h.key_material[0..data12.key_material.len]);
 }
 
+test "tls 1.2 accepts certificate status when advertised" {
+    const certificate_status = testu.hexToBytes(
+        \\ 16 03 03 00 0c
+        \\ 16 00 00 08
+        \\ 01 00 00 04 de ad be ef
+    );
+    const server_hello_responses =
+        data12.server_hello ++ data12.server_certificate ++ certificate_status ++
+        data12.server_key_exchange ++ data12.server_hello_done;
+
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var reader: Io.Reader = .fixed(&server_hello_responses);
+    var h: Handshake = .{
+        .output = &writer,
+        .input = &reader,
+        .client_random = data12.client_random,
+        .status_request_advertised = true,
+    };
+    h.dh_kp.x25519_kp.secret_key = data12.client_secret;
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .empty, .now_sec = 0 };
+
+    try h.readServerFlight1();
+
+    try testing.expectEqual(.ECDHE_RSA_WITH_AES_128_CBC_SHA, h.cipher_suite);
+    try testing.expectEqual(.x25519, h.named_group.?);
+    try testing.expectEqualSlices(u8, &data12.server_pub_key, h.server_pub_key);
+}
+
+test "tls 1.2 rejects certificate status when not advertised" {
+    const certificate_status = testu.hexToBytes(
+        \\ 16 03 03 00 0c
+        \\ 16 00 00 08
+        \\ 01 00 00 04 de ad be ef
+    );
+    const server_hello_responses =
+        data12.server_hello ++ data12.server_certificate ++ certificate_status ++
+        data12.server_key_exchange ++ data12.server_hello_done;
+
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var reader: Io.Reader = .fixed(&server_hello_responses);
+    var h: Handshake = .{
+        .output = &writer,
+        .input = &reader,
+        .client_random = data12.client_random,
+    };
+    h.dh_kp.x25519_kp.secret_key = data12.client_secret;
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .empty, .now_sec = 0 };
+
+    try testing.expectError(error.TlsUnexpectedMessage, h.readServerFlight1());
+}
+
 test "verify google.com certificate" {
     var buffer: [1024]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
@@ -1223,17 +1305,54 @@ test "tls 1.3 preserves post-handshake auth transcript without client cert" {
     try testing.expect(h.post_handshake_transcript != null);
 }
 
+test "tls 1.3 certificate status extension is ignored" {
+    const status_request_ext = testu.hexToBytes("00 05 00 05 01 00 00 00 00");
+    const ext_len_pos = data13.server_certificate.len - 2;
+    var cert_msg: [data13.server_certificate.len + status_request_ext.len]u8 = undefined;
+
+    @memcpy(cert_msg[0..ext_len_pos], data13.server_certificate[0..ext_len_pos]);
+    std.mem.writeInt(
+        u24,
+        cert_msg[1..4],
+        std.mem.readInt(u24, data13.server_certificate[1..4], .big) + status_request_ext.len,
+        .big,
+    );
+    std.mem.writeInt(
+        u24,
+        cert_msg[5..8],
+        std.mem.readInt(u24, data13.server_certificate[5..8], .big) + status_request_ext.len,
+        .big,
+    );
+    std.mem.writeInt(u16, cert_msg[ext_len_pos .. ext_len_pos + 2], status_request_ext.len, .big);
+    @memcpy(cert_msg[ext_len_pos + 2 ..][0..status_request_ext.len], &status_request_ext);
+
+    var d = record.Decoder.init(.handshake, &cert_msg);
+    try testing.expectEqual(.certificate, try d.decode(proto.Handshake));
+    const body_len = try d.decode(u24);
+    try testing.expectEqual(d.rest().len, @as(usize, body_len));
+
+    var parser: CertificateParser = .{
+        .host = "example.ulfheim.net",
+        .root_ca = .empty,
+        .skip_verify = true,
+        .now_sec = 1714846451,
+    };
+    try parser.parseCertificate(&d, .tls_1_3);
+    try testing.expect(d.eof());
+}
+
 test "create client hello" {
     const expected = testu.hexToBytes(
-        "16 03 03 00 79 " ++ // record header
-            "01 00 00 75 " ++ // handshake header
+        "16 03 03 00 82 " ++ // record header
+            "01 00 00 7e " ++ // handshake header
             "03 03 " ++ // protocol version
             "00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f " ++ // client random
             "00 " ++ // no session id
             "00 02 c0 2b " ++ // cipher suites
             "01 00 " ++ // compression methods
-            "00 4a " ++ // extensions length
+            "00 53 " ++ // extensions length
             "ff 01 00 01 00 " ++ // renegotiation_info extension
+            "00 05 00 05 01 00 00 00 00 " ++ // status_request extension
             "00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01 " ++ // signature algorithms extension
             "00 0a 00 08 00 06 00 1d 00 17 00 18 " ++ // named groups extension
             "00 0b 00 02 01 00 " ++ // EC point formats extension
@@ -1266,8 +1385,33 @@ test "create client hello" {
 
     const actual = h.output.buffered();
     try testing.expectEqualSlices(u8, &expected, actual);
-    try testing.expectEqual(140, h.output.unusedCapacityLen());
-    try testing.expectEqual(126, expected.len);
+    try testing.expectEqual(131, h.output.unusedCapacityLen());
+    try testing.expectEqual(135, expected.len);
+}
+
+test "client hello advertises status request" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 05 00 05 01 00 00 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+    try testing.expect(h.status_request_advertised);
 }
 
 test "client hello advertises post-handshake auth with client cert" {
@@ -1344,6 +1488,9 @@ test "client hello omits post-handshake auth for tls 1.2 only" {
 
     const ext = testu.hexToBytes("00 31 00 00");
     try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) == null);
+    const status_request_ext = testu.hexToBytes("00 05 00 05 01 00 00 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &status_request_ext) != null);
+    try testing.expect(h.status_request_advertised);
     try testing.expect(!h.post_handshake_auth_advertised);
 }
 

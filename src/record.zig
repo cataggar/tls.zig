@@ -482,6 +482,19 @@ test "Writer" {
     try testing.expectEqualSlices(u8, &[_]u8{ 'a', 'b', 0x03, 0x00, 0x1d, 0x12, 0x34 }, w.buffered());
 }
 
+test "status_request extension writer" {
+    var buf: [9]u8 = undefined;
+    var w = Writer.init(&buf);
+
+    try w.statusRequest();
+
+    try testing.expectEqualSlices(
+        u8,
+        &testu.hexToBytes("00 05 00 05 01 00 00 00 00"),
+        w.buffered(),
+    );
+}
+
 fn int2(int: u16) [2]u8 {
     var arr: [2]u8 = undefined;
     std.mem.writeInt(u16, &arr, int, .big);
