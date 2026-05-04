@@ -135,6 +135,10 @@ pub const Connection = struct {
             const hs_msg = cleartext[off..end];
             const handshake_type: proto.Handshake = @enumFromInt(hs_msg[0]);
             switch (handshake_type) {
+                .hello_request => {
+                    if (hs_msg.len != 4) return error.TlsDecodeError;
+                    try c.encryptWrite(.alert, &proto.Alert.noRenegotiation());
+                },
                 .new_session_ticket => {
                     if (c.session_resumption) |r| {
                         if (c.session_resumption_secret_idx) |secret_idx| {
@@ -490,6 +494,63 @@ test "encrypt decrypt" {
         try testing.expectEqual(4, n);
         try testing.expectEqualStrings("pong", buffer[0..n]);
     }
+}
+
+test "post-handshake auth without client certificate sends empty certificate" {
+    const client_secret = [_]u8{0x11} ** 32;
+    const server_secret = [_]u8{0x22} ** 32;
+    const secret: Transcript.Secret = .{
+        .client = &client_secret,
+        .server = &server_secret,
+    };
+
+    var transcript: Transcript = .{};
+    transcript.use(.sha256);
+    transcript.update("base handshake transcript");
+    transcript.setPostHandshakeFinishedKey(&client_secret);
+
+    var output_buf: [256]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var conn: Connection = .{
+        .input = undefined,
+        .output = &output,
+        .cipher = try Cipher.initTls13(.AES_128_GCM_SHA256, secret, .client),
+        .post_handshake_transcript = transcript,
+    };
+
+    const cert_request = testu.hexToBytes("0d 00 00 06 03 aa bb cc 00 00");
+    try conn.handlePostHandshakeMessages(&cert_request);
+    try testing.expect(conn.post_handshake_transcript != null);
+
+    var server_cipher = try Cipher.initTls13(.AES_128_GCM_SHA256, secret, .server);
+    var output_reader: Io.Reader = .fixed(output.buffered());
+    var cleartext_buf: [128]u8 = undefined;
+
+    {
+        const rec = try Record.read(&output_reader);
+        const content_type, const cleartext = try server_cipher.decrypt(&cleartext_buf, rec);
+        try testing.expectEqual(.handshake, content_type);
+        try testing.expectEqualSlices(
+            u8,
+            &testu.hexToBytes("0b 00 00 07 03 aa bb cc 00 00 00"),
+            cleartext,
+        );
+    }
+
+    {
+        const rec = try Record.read(&output_reader);
+        const content_type, const cleartext = try server_cipher.decrypt(&cleartext_buf, rec);
+        try testing.expectEqual(.handshake, content_type);
+
+        var d = record.Decoder.init(.handshake, cleartext);
+        try testing.expectEqual(.finished, try d.decode(proto.Handshake));
+        const finished_len = try d.decode(u24);
+        try testing.expectEqual(@as(u24, 32), finished_len);
+        _ = try d.slice(finished_len);
+        try testing.expect(d.eof());
+    }
+
+    try testing.expectError(error.EndOfStream, Record.read(&output_reader));
 }
 
 // Copied from: https://github.com/ziglang/zig/blob/455899668b620dfda40252501c748c0a983555bd/lib/std/crypto/tls/Client.zig#L1354
