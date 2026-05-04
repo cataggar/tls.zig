@@ -495,6 +495,19 @@ test "status_request extension writer" {
     );
 }
 
+test "renegotiation_info extension writer" {
+    var buf: [5]u8 = undefined;
+    var w = Writer.init(&buf);
+
+    try w.emptyRenegotiationInfo();
+
+    try testing.expectEqualSlices(
+        u8,
+        &testu.hexToBytes("ff 01 00 01 00"),
+        w.buffered(),
+    );
+}
+
 fn int2(int: u16) [2]u8 {
     var arr: [2]u8 = undefined;
     std.mem.writeInt(u16, &arr, int, .big);
