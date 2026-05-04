@@ -31,16 +31,20 @@ pub fn init(env: std.process.Environ) Callback {
 }
 
 /// Writes tls keys to the file pointed by SSLKEYLOGFILE environment variable.
-fn callback(label_: []const u8, client_random: []const u8, secret: []const u8) void {
-    const builtin = @import("builtin");
-    const native_os = builtin.os.tag;
-    const file_name: []const u8 = if (native_os == .windows)
-        return
-    else if (native_os == .wasi and !builtin.link_libc)
-        return
-    else
-        environ.getPosix(key_log_file_env) orelse return;
-    fileAppend(file_name, label_, client_random, secret) catch return;
+pub fn callback(label_: []const u8, client_random: []const u8, secret: []const u8) void {
+    const allocator = std.heap.page_allocator;
+    const file_name = environ.getAlloc(allocator, key_log_file_env) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return,
+        else => {
+            std.debug.print("key_log: SSLKEYLOGFILE lookup error: {s}\n", .{@errorName(err)});
+            return;
+        },
+    };
+    defer allocator.free(file_name);
+
+    fileAppend(file_name, label_, client_random, secret) catch |err| {
+        std.debug.print("key_log: write error: {s}\n", .{@errorName(err)});
+    };
 }
 
 fn fileAppend(file_name: []const u8, label_: []const u8, client_random: []const u8, secret: []const u8) !void {
@@ -53,7 +57,10 @@ fn fileWrite(file_name: []const u8, line: []const u8) !void {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
-    var file = try std.Io.Dir.createFileAbsolute(io, file_name, .{ .truncate = false });
+    var file = std.Io.Dir.openFileAbsolute(io, file_name, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.createFileAbsolute(io, file_name, .{ .read = true, .truncate = false }),
+        else => return err,
+    };
     defer file.close(io);
     const stat = try file.stat(io);
     try file.writePositionalAll(io, line, stat.size);

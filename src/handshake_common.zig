@@ -195,24 +195,25 @@ pub const CertificateBuilder = struct {
     tls_version: proto.Version = .tls_1_3,
     side: proto.Side = .client,
     rng: std.Random,
+    certificate_request_context: []const u8 = &.{},
 
     pub fn makeCertificate(h: CertificateBuilder, w: *record.Writer) !void {
         const certs = h.cert_key_pair.bundle.bytes.items;
         const certs_count = h.cert_key_pair.bundle.map.size;
 
-        // Differences between tls 1.3 and 1.2
-        // TLS 1.3 has request context in header and extensions for each certificate.
-        // Here we use empty length for each field.
-        // TLS 1.2 don't have these two fields.
-        const request_context, const extensions = if (h.tls_version == .tls_1_3)
-            .{ &[_]u8{0}, &[_]u8{ 0, 0 } }
-        else
-            .{ &[_]u8{}, &[_]u8{} };
+        // TLS 1.3 has a request context in the Certificate header and
+        // extensions for each certificate. TLS 1.2 has neither.
+        const extensions = if (h.tls_version == .tls_1_3) &[_]u8{ 0, 0 } else &[_]u8{};
         const certs_len = certs.len + (3 + extensions.len) * certs_count;
 
-        // Write handshake header
-        try w.handshakeRecordHeader(.certificate, certs_len + request_context.len + 3);
-        try w.slice(request_context);
+        if (h.tls_version == .tls_1_3) {
+            if (h.certificate_request_context.len > std.math.maxInt(u8)) return error.TlsIllegalParameter;
+            try w.handshakeRecordHeader(.certificate, certs_len + h.certificate_request_context.len + 4);
+            try w.byte(@intCast(h.certificate_request_context.len));
+            try w.slice(h.certificate_request_context);
+        } else {
+            try w.handshakeRecordHeader(.certificate, certs_len + 3);
+        }
         try w.int(u24, certs_len);
 
         // Write each certificate
