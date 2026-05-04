@@ -1009,11 +1009,17 @@ pub const Handshake = struct {
     }
 
     fn readServerFlight2(h: *Self) !void {
-        // Read server change cipher spec message.
-        {
+        // Read optional TLS 1.2 NewSessionTicket messages, then server change cipher spec.
+        while (true) {
             var d = try Record.decoder(h.input);
-            try d.expectContentType(.change_cipher_spec);
             h.max_server_record_len = @max(h.max_server_record_len, d.payload.len + record.header_len);
+
+            switch (d.content_type) {
+                .change_cipher_spec => break,
+                .handshake => try h.readServerFlight2Handshake(&d),
+                .alert => try d.raiseAlert(),
+                else => return error.TlsUnexpectedMessage,
+            }
         }
         // Read encrypted server handshake finished message. Verify that
         // content of the server finished message is based on transcript
@@ -1029,6 +1035,31 @@ pub const Handshake = struct {
             if (!mem.eql(u8, server_finished, &expected))
                 return error.TlsBadRecordMac;
         }
+    }
+
+    fn readServerFlight2Handshake(h: *Self, d: *record.Decoder) !void {
+        h.transcript.update(d.payload);
+
+        while (!d.eof()) {
+            const handshake_type = try d.decode(proto.Handshake);
+            const length = try d.decode(u24);
+            if (length > d.rest().len) return error.TlsUnsupportedFragmentedHandshakeMessage;
+
+            switch (handshake_type) {
+                .new_session_ticket => try parseTls12NewSessionTicket(d, length),
+                else => return error.TlsUnexpectedMessage,
+            }
+        }
+    }
+
+    fn parseTls12NewSessionTicket(d: *record.Decoder, length: u24) !void {
+        if (length < 6) return error.TlsDecodeError;
+
+        const end = d.idx + @as(usize, length);
+        _ = try d.decode(u32); // ticket_lifetime_hint
+        const ticket_len = try d.decode(u16);
+        if (ticket_len != end - d.idx) return error.TlsDecodeError;
+        try d.skip(ticket_len);
     }
 
     /// Write encrypted handshake message into `w`
@@ -1810,6 +1841,51 @@ test "handshake verify server finished message" {
 
     // check that server verify data matches calculates from hashes of all handshake messages
     h.transcript.update(&data12.client_finished);
+    try h.readServerFlight2();
+}
+
+test "tls 1.2 server flight 2 accepts new session ticket before change cipher spec" {
+    const new_session_ticket =
+        record.header(.handshake, 10) ++
+        record.handshakeHeader(.new_session_ticket, 6) ++
+        [_]u8{ 0, 0, 0, 0, 0, 0 };
+
+    var h: Handshake = brk: {
+        var output_buffer: [1024]u8 = undefined;
+        var writer: Io.Writer = .fixed(&output_buffer);
+        break :brk .{ .input = undefined, .output = &writer };
+    };
+
+    h.cipher_suite = .ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+    h.master_secret = data12.master_secret;
+
+    for (data12.handshake_messages) |msg| {
+        h.transcript.update(msg[record.header_len..]);
+    }
+    h.transcript.update(&data12.client_finished);
+
+    var server_transcript = h.transcript;
+    server_transcript.update(new_session_ticket[record.header_len..]);
+    const server_finished = record.handshakeHeader(.finished, 12) ++
+        server_transcript.serverFinishedTls12(&h.master_secret);
+
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var server_cipher = try Cipher.initTls12(h.cipher_suite, &data12.key_material, .server, rng);
+    var encrypted_finished_buf: [max_ciphertext_record_len]u8 = undefined;
+    const encrypted_finished = try server_cipher.encrypt(&encrypted_finished_buf, .handshake, &server_finished);
+
+    var input_buffer: [new_session_ticket.len + data12.server_change_cipher_spec.len + max_ciphertext_record_len]u8 = undefined;
+    var input_writer: Io.Writer = .fixed(&input_buffer);
+    try input_writer.writeAll(&new_session_ticket);
+    try input_writer.writeAll(&data12.server_change_cipher_spec);
+    try input_writer.writeAll(encrypted_finished);
+
+    var reader: Io.Reader = .fixed(input_writer.buffered());
+    h.input = &reader;
+    h.cipher = try Cipher.initTls12(h.cipher_suite, &data12.key_material, .client, rng);
+
     try h.readServerFlight2();
 }
 
