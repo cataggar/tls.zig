@@ -1414,6 +1414,54 @@ test "client hello advertises status request" {
     try testing.expect(h.status_request_advertised);
 }
 
+test "client hello advertises secure renegotiation for tls 1.3 capable clients" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("ff 01 00 01 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+}
+
+test "client hello advertises secure renegotiation for tls 1.2 only clients" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("ff 01 00 01 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+}
+
 test "client hello advertises post-handshake auth with client cert" {
     var auth: CertKeyPair = undefined;
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };

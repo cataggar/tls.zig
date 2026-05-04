@@ -419,6 +419,17 @@ const testing = std.testing;
 const data12 = @import("testdata/tls12.zig");
 const testu = @import("testu.zig");
 
+fn expectEncryptedAlert(server_cipher: *Cipher, encrypted: []const u8, expected: [2]u8) !void {
+    var input: Io.Reader = .fixed(encrypted);
+    var cleartext_buf: [64]u8 = undefined;
+
+    const rec = try Record.read(&input);
+    const content_type, const cleartext = try server_cipher.decrypt(&cleartext_buf, rec);
+    try testing.expectEqual(.alert, content_type);
+    try testing.expectEqualSlices(u8, &expected, cleartext);
+    try testing.expectError(error.EndOfStream, Record.read(&input));
+}
+
 test "encrypt decrypt" {
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };
     const rng = rng_impl.interface();
@@ -494,6 +505,64 @@ test "encrypt decrypt" {
         try testing.expectEqual(4, n);
         try testing.expectEqualStrings("pong", buffer[0..n]);
     }
+}
+
+test "tls 1.2 hello request sends no_renegotiation and continues" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var server_cipher = try Cipher.initTls12(.ECDHE_RSA_WITH_AES_128_CBC_SHA, &data12.key_material, .server, rng);
+    server_cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x20);
+
+    var input_buf: [256]u8 = undefined;
+    var input_end: usize = 0;
+    {
+        const hello_request = record.handshakeHeader(.hello_request, 0);
+        const encrypted = try server_cipher.encrypt(input_buf[input_end..], .handshake, &hello_request);
+        input_end += encrypted.len;
+    }
+    {
+        const encrypted = try server_cipher.encrypt(input_buf[input_end..], .application_data, "pong");
+        input_end += encrypted.len;
+    }
+
+    var output_buf: [128]u8 = undefined;
+    var stream_reader: Io.Reader = .fixed(input_buf[0..input_end]);
+    var stream_writer: Io.Writer = .fixed(&output_buf);
+    var conn: Connection = .{
+        .input = &stream_reader,
+        .output = &stream_writer,
+        .cipher = try Cipher.initTls12(.ECDHE_RSA_WITH_AES_128_CBC_SHA, &data12.key_material, .client, rng),
+    };
+    conn.cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x80);
+
+    try testing.expectEqualStrings("pong", (try conn.next()).?);
+    try expectEncryptedAlert(&server_cipher, stream_writer.buffered(), proto.Alert.noRenegotiation());
+}
+
+test "tls 1.2 malformed hello request sends fatal decode error" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var server_cipher = try Cipher.initTls12(.ECDHE_RSA_WITH_AES_128_CBC_SHA, &data12.key_material, .server, rng);
+    server_cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x20);
+
+    var input_buf: [128]u8 = undefined;
+    const malformed_hello_request = record.handshakeHeader(.hello_request, 1) ++ [_]u8{0};
+    const encrypted = try server_cipher.encrypt(&input_buf, .handshake, &malformed_hello_request);
+
+    var output_buf: [128]u8 = undefined;
+    var stream_reader: Io.Reader = .fixed(encrypted);
+    var stream_writer: Io.Writer = .fixed(&output_buf);
+    var conn: Connection = .{
+        .input = &stream_reader,
+        .output = &stream_writer,
+        .cipher = try Cipher.initTls12(.ECDHE_RSA_WITH_AES_128_CBC_SHA, &data12.key_material, .client, rng),
+    };
+    conn.cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x80);
+
+    try testing.expectError(error.TlsDecodeError, conn.next());
+    try expectEncryptedAlert(&server_cipher, stream_writer.buffered(), proto.alertFromError(error.TlsDecodeError));
 }
 
 test "post-handshake auth without client certificate sends empty certificate" {
