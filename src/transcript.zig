@@ -138,6 +138,13 @@ pub const Transcript = struct {
         };
     }
 
+    /// Replace the client Finished key for TLS 1.3 post-handshake authentication.
+    pub fn setPostHandshakeFinishedKey(t: *Transcript, secret: []const u8) void {
+        switch (t.tag) {
+            inline else => |h| @field(t, @tagName(h)).setPostHandshakeFinishedKey(secret),
+        }
+    }
+
     pub const Secret = struct {
         client: []const u8,
         server: []const u8,
@@ -371,6 +378,10 @@ fn TranscriptT(comptime Hash: type) type {
             const expanded = hkdfExpandLabel(Hkdf, prk, "finished", "", hash_length);
             Hmac.create(self.buffer[0..hash_length], &self.hash.peek(), &expanded);
             return self.buffer[0..hash_length];
+        }
+
+        fn setPostHandshakeFinishedKey(self: *Self, secret: []const u8) void {
+            self.client_finished_key = hkdfExpandLabel(Hkdf, secret[0..hash_length].*, "finished", "", hash_length);
         }
 
         fn serverFinishedTls13(self: *Self) []const u8 {

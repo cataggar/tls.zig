@@ -9,6 +9,7 @@ const Cipher = @import("cipher.zig").Cipher;
 const CipherSuite = @import("cipher.zig").CipherSuite;
 const cipher_suites = @import("cipher.zig").cipher_suites;
 const max_cleartext_len = @import("cipher.zig").max_cleartext_len;
+const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
 
 const Transcript = @import("transcript.zig").Transcript;
 const record = @import("record.zig");
@@ -238,6 +239,10 @@ pub const Handshake = struct {
     /// ALPN protocol selected by the server, copied into alpn_protocol_buf.
     alpn_protocol: ?[]const u8 = null,
     alpn_protocol_buf: [32]u8 = undefined,
+    /// Transcript snapshot used as the base for TLS 1.3 post-handshake auth.
+    post_handshake_transcript: ?Transcript = null,
+    client_application_traffic_secret: [64]u8 = undefined,
+    client_application_traffic_secret_len: usize = 0,
     // statistics
     max_server_record_len: usize = 0,
     max_server_cleartext_len: usize = 0,
@@ -346,6 +351,7 @@ pub const Handshake = struct {
             try h.readEncryptedServerFlight1(resumption_ticket != null); // server flight 1
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth, opt.rng); // client flight 2
+            h.savePostHandshakeAuthState(opt.auth);
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
             try h.output.flush();
 
@@ -383,6 +389,7 @@ pub const Handshake = struct {
         if (h.tls_version == .tls_1_3) {
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth, opt.rng);
+            h.savePostHandshakeAuthState(opt.auth);
             h.cipher = app_cipher;
         } else {
             // tls 1.2 specific handshake part
@@ -432,11 +439,29 @@ pub const Handshake = struct {
     /// TLS 1.3 application (client) cipher
     fn generateApplicationCipher(h: *Self, key_log_callback: ?key_log.Callback) !Cipher {
         const application_secret = h.transcript.applicationSecret();
+        h.client_application_traffic_secret_len = h.transcript.hashLength();
+        @memcpy(
+            h.client_application_traffic_secret[0..h.client_application_traffic_secret_len],
+            application_secret.client[0..h.client_application_traffic_secret_len],
+        );
         if (key_log_callback) |cb| {
             cb(key_log.label.server_traffic_secret_0, &h.client_random, application_secret.server);
             cb(key_log.label.client_traffic_secret_0, &h.client_random, application_secret.client);
         }
         return try Cipher.initTls13(h.cipher_suite, application_secret, .client);
+    }
+
+    fn savePostHandshakeAuthState(h: *Self, auth: ?*CertKeyPair) void {
+        if (auth == null) {
+            h.post_handshake_transcript = null;
+            return;
+        }
+
+        var transcript = h.transcript;
+        transcript.setPostHandshakeFinishedKey(
+            h.client_application_traffic_secret[0..h.client_application_traffic_secret_len],
+        );
+        h.post_handshake_transcript = transcript;
     }
 
     fn makeClientHello(h: *Self, opt: Options, resumption_ticket: ?ResumptionTicket) !void {
@@ -476,6 +501,10 @@ pub const Handshake = struct {
         try w.serverName(opt.host);
         if (opt.alpn_protocols.len > 0) {
             try w.alpn(opt.alpn_protocols);
+        }
+        if (tls_versions != .tls_1_2 and opt.auth != null) {
+            try w.enumValue(proto.Extension.post_handshake_auth);
+            try w.int(u16, 0);
         }
         // binder key placeholder
         const binder_pos: ?usize = if (resumption_ticket) |ticket| brk: {
@@ -914,7 +943,8 @@ pub const Handshake = struct {
         {
             const rec = try Record.read(h.input);
             h.max_server_record_len = @max(h.max_server_record_len, rec.buffer.len);
-            const content_type, const server_finished = try h.cipher.decrypt(@constCast(rec.buffer), rec);
+            var cleartext_buf: [max_ciphertext_record_len]u8 = undefined;
+            const content_type, const server_finished = try h.cipher.decrypt(&cleartext_buf, rec);
             if (content_type != .handshake)
                 return error.TlsUnexpectedMessage;
             const expected = record.handshakeHeader(.finished, 12) ++ h.transcript.serverFinishedTls12(&h.master_secret);
@@ -1190,6 +1220,32 @@ test "create client hello" {
     try testing.expectEqualSlices(u8, &expected, actual);
     try testing.expectEqual(152, h.output.unusedCapacityLen());
     try testing.expectEqual(114, expected.len);
+}
+
+test "client hello advertises post-handshake auth with client cert" {
+    var auth: CertKeyPair = undefined;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .auth = &auth,
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 31 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
 }
 
 test "client hello size" {

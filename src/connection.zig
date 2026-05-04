@@ -10,6 +10,10 @@ const Record = record.Record;
 const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 const SessionResumption = @import("handshake_client.zig").Options.SessionResumption;
+const Transcript = @import("transcript.zig").Transcript;
+const common = @import("handshake_common.zig");
+const CertificateBuilder = common.CertificateBuilder;
+const CertKeyPair = common.CertKeyPair;
 
 const log = std.log.scoped(.tls);
 
@@ -24,6 +28,7 @@ pub const Connection = struct {
     received_close_notify: bool = false,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
+    cleartext_storage: [cipher.max_ciphertext_record_len]u8 = undefined,
 
     session_resumption: ?*SessionResumption = null,
     session_resumption_secret_idx: ?usize = null,
@@ -31,6 +36,9 @@ pub const Connection = struct {
     /// ALPN protocol negotiated during TLS handshake (e.g., "h2", "http/1.1").
     /// Points into static data or the options slice; valid for the connection lifetime.
     alpn_protocol: ?[]const u8 = null,
+    auth: ?*CertKeyPair = null,
+    rng: ?std.Random = null,
+    post_handshake_transcript: ?Transcript = null,
 
     const Self = @This();
 
@@ -90,44 +98,16 @@ pub const Connection = struct {
             const rec = try Record.read(c.input);
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
 
-            // If provided buffer is not big enough reuse input buffer for
-            // cleartext. `rec.header` and `rec.payload`(ciphertext) are
-            // pointing somewhere in this buffer. Decrypter is first reading
-            // then writing a block, cleartext has less length then ciphertext,
-            // cleartext starts from the beginning of the buffer, so ciphertext
-            // is always ahead of cleartext.
-            const cleartext_buf = if (buffer.len >= rec.payload.len) buffer else @constCast(rec.buffer);
+            // If provided buffer is not big enough use connection-owned
+            // storage so readers backed by constant memory are never mutated.
+            const cleartext_buf = if (buffer.len >= rec.payload.len) buffer else &c.cleartext_storage;
             const content_type, const cleartext = try c.cipher.decrypt(cleartext_buf, rec);
 
             switch (content_type) {
                 .application_data => {},
                 .handshake => {
-                    const handshake_type: proto.Handshake = @enumFromInt(cleartext[0]);
-                    switch (handshake_type) {
-                        .new_session_ticket => {
-                            if (c.session_resumption) |r| {
-                                r.pushTicket(cleartext, c.session_resumption_secret_idx.?) catch {};
-                            }
-                            continue;
-                        },
-                        .key_update => {
-                            if (cleartext.len != 5) return error.TlsDecodeError;
-                            // rfc: Upon receiving a KeyUpdate, the receiver MUST
-                            // update its receiving keys.
-                            try c.cipher.keyUpdateDecrypt();
-                            const key: proto.KeyUpdateRequest = @enumFromInt(cleartext[4]);
-                            switch (key) {
-                                .update_requested => {
-                                    @atomicStore(bool, &c.key_update_requested, true, .monotonic);
-                                },
-                                .update_not_requested => {},
-                                else => return error.TlsIllegalParameter,
-                            }
-                            // this record is handled read next
-                            continue;
-                        },
-                        else => {},
-                    }
+                    try c.handlePostHandshakeMessages(cleartext);
+                    continue;
                 },
                 .alert => {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
@@ -140,6 +120,100 @@ pub const Connection = struct {
             }
             return cleartext;
         }
+    }
+
+    fn handlePostHandshakeMessages(c: *Self, cleartext: []const u8) !void {
+        var off: usize = 0;
+        while (off < cleartext.len) {
+            if (cleartext.len - off < 4) return error.TlsDecodeError;
+            const length = (@as(usize, cleartext[off + 1]) << 16) |
+                (@as(usize, cleartext[off + 2]) << 8) |
+                @as(usize, cleartext[off + 3]);
+            const end = off + 4 + length;
+            if (end > cleartext.len) return error.TlsUnsupportedFragmentedHandshakeMessage;
+
+            const hs_msg = cleartext[off..end];
+            const handshake_type: proto.Handshake = @enumFromInt(hs_msg[0]);
+            switch (handshake_type) {
+                .new_session_ticket => {
+                    if (c.session_resumption) |r| {
+                        if (c.session_resumption_secret_idx) |secret_idx| {
+                            r.pushTicket(hs_msg, secret_idx) catch {};
+                        }
+                    }
+                },
+                .key_update => {
+                    if (hs_msg.len != 5) return error.TlsDecodeError;
+                    // rfc: Upon receiving a KeyUpdate, the receiver MUST update its receiving keys.
+                    try c.cipher.keyUpdateDecrypt();
+                    const key: proto.KeyUpdateRequest = @enumFromInt(hs_msg[4]);
+                    switch (key) {
+                        .update_requested => @atomicStore(bool, &c.key_update_requested, true, .monotonic),
+                        .update_not_requested => {},
+                        else => return error.TlsIllegalParameter,
+                    }
+                },
+                .certificate_request => try c.handlePostHandshakeAuth(hs_msg),
+                else => return error.TlsUnexpectedMessage,
+            }
+            off = end;
+        }
+    }
+
+    fn handlePostHandshakeAuth(c: *Self, cert_request: []const u8) !void {
+        var transcript = c.post_handshake_transcript orelse return error.TlsUnexpectedMessage;
+        const ctx = try certificateRequestContext(cert_request);
+        transcript.update(cert_request);
+
+        if (c.auth) |auth| {
+            const rng = c.rng orelse return error.TlsUnexpectedMessage;
+            const cb: CertificateBuilder = .{
+                .cert_key_pair = auth,
+                .transcript = &transcript,
+                .tls_version = .tls_1_3,
+                .side = .client,
+                .rng = rng,
+                .certificate_request_context = ctx,
+            };
+
+            var cert_buf: [16384]u8 = undefined;
+            var cert_w = record.Writer.init(&cert_buf);
+            try cb.makeCertificate(&cert_w);
+            try c.writePostHandshakeMessage(&transcript, cert_w.buffered());
+
+            var cv_buf: [1024]u8 = undefined;
+            var cv_w = record.Writer.init(&cv_buf);
+            try cb.makeCertificateVerify(&cv_w);
+            try c.writePostHandshakeMessage(&transcript, cv_w.buffered());
+        } else {
+            var cert_buf: [128]u8 = undefined;
+            var cert_w = record.Writer.init(&cert_buf);
+            try cert_w.handshakeRecordHeader(.certificate, ctx.len + 4);
+            try cert_w.byte(@intCast(ctx.len));
+            try cert_w.slice(ctx);
+            try cert_w.int(u24, 0);
+            try c.writePostHandshakeMessage(&transcript, cert_w.buffered());
+        }
+
+        var fin_buf: [128]u8 = undefined;
+        var fin_w = record.Writer.init(&fin_buf);
+        try fin_w.handshakeRecord(.finished, transcript.clientFinishedTls13());
+        try c.writePostHandshakeMessage(&transcript, fin_w.buffered());
+
+        c.post_handshake_transcript = transcript;
+    }
+
+    fn writePostHandshakeMessage(c: *Self, transcript: *Transcript, msg: []const u8) !void {
+        transcript.update(msg);
+        try c.encryptWrite(.handshake, msg);
+    }
+
+    fn certificateRequestContext(cert_request: []const u8) ![]const u8 {
+        var d = record.Decoder.init(.handshake, cert_request);
+        if (try d.decode(proto.Handshake) != .certificate_request) return error.TlsUnexpectedMessage;
+        const length = try d.decode(u24);
+        if (length != d.rest().len) return error.TlsDecodeError;
+        return try d.slice(try d.decode(u8));
     }
 
     pub fn eof(c: *Self) bool {
@@ -460,7 +534,6 @@ test "client/server connection" {
 
     // create ciphers pair
     const cipher_client, const cipher_server = brk: {
-        const Transcript = @import("transcript.zig").Transcript;
         const CipherSuite = @import("cipher.zig").CipherSuite;
         const cipher_suite: CipherSuite = .AES_256_GCM_SHA384;
 

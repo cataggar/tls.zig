@@ -41,6 +41,9 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, opt: config.Client) !Connec
         .session_resumption_secret_idx = session_resumption_secret_idx,
         .session_resumption = opt.session_resumption,
         .alpn_protocol = hc.alpn_protocol,
+        .auth = opt.auth,
+        .rng = opt.rng,
+        .post_handshake_transcript = hc.post_handshake_transcript,
     };
 }
 
