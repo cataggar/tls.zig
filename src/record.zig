@@ -325,6 +325,36 @@ pub const Writer = struct {
         }
     }
 
+    /// Initial secure renegotiation signaling extension (RFC 5746).
+    pub fn emptyRenegotiationInfo(w: *Writer) !void {
+        try w.enumValue(proto.Extension.renegotiation_info);
+        try w.int(u16, 1);
+        try w.int(u8, 0);
+    }
+
+    /// Empty extension with no payload.
+    pub fn emptyExtension(w: *Writer, ex: proto.Extension) !void {
+        try w.enumValue(ex);
+        try w.int(u16, 0);
+    }
+
+    /// OCSP status_request extension with an empty responder list.
+    pub fn statusRequest(w: *Writer) !void {
+        try w.enumValue(proto.Extension.status_request);
+        try w.int(u16, 5);
+        try w.int(u8, 1);
+        try w.int(u16, 0);
+        try w.int(u16, 0);
+    }
+
+    /// EC point formats extension for TLS 1.2 ECDHE interop.
+    pub fn ecPointFormats(w: *Writer) !void {
+        try w.enumValue(proto.Extension.ec_point_formats);
+        try w.int(u16, 2);
+        try w.int(u8, 1);
+        try w.int(u8, 0); // uncompressed
+    }
+
     /// Server name extension
     pub fn serverName(w: *Writer, host: []const u8) !void {
         const host_len: u16 = @intCast(host.len);

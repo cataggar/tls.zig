@@ -14,6 +14,7 @@ pub const ContentType = enum(u8) {
 };
 
 pub const Handshake = enum(u8) {
+    hello_request = 0,
     client_hello = 1,
     server_hello = 2,
     new_session_ticket = 4,
@@ -42,6 +43,8 @@ pub const KeyExchangeModes = enum(u8) {
 };
 
 pub const Extension = enum(u16) {
+    /// RFC 5746
+    renegotiation_info = 0xff01,
     /// RFC 6066
     server_name = 0,
     /// RFC 6066
@@ -50,6 +53,8 @@ pub const Extension = enum(u16) {
     status_request = 5,
     /// RFC 8422, 7919
     supported_groups = 10,
+    /// RFC 8422
+    ec_point_formats = 11,
     /// RFC 8446
     signature_algorithms = 13,
     /// RFC 5764
@@ -66,6 +71,12 @@ pub const Extension = enum(u16) {
     server_certificate_type = 20,
     /// RFC 7685
     padding = 21,
+    /// RFC 7366
+    encrypt_then_mac = 22,
+    /// RFC 7627
+    extended_master_secret = 23,
+    /// RFC 5077
+    session_ticket = 35,
     /// RFC 8446
     pre_shared_key = 41,
     /// RFC 8446
@@ -120,6 +131,7 @@ pub const Alert = enum(u8) {
         TlsAlertInsufficientSecurity,
         TlsAlertInternalError,
         TlsAlertInappropriateFallback,
+        TlsAlertNoRenegotiation,
         TlsAlertMissingExtension,
         TlsAlertUnsupportedExtension,
         TlsAlertUnrecognizedName,
@@ -150,6 +162,7 @@ pub const Alert = enum(u8) {
     internal_error = 80,
     inappropriate_fallback = 86,
     user_canceled = 90,
+    no_renegotiation = 100,
     missing_extension = 109,
     unsupported_extension = 110,
     unrecognized_name = 112,
@@ -181,6 +194,7 @@ pub const Alert = enum(u8) {
             .internal_error => error.TlsAlertInternalError,
             .inappropriate_fallback => error.TlsAlertInappropriateFallback,
             .user_canceled => {}, // not an error
+            .no_renegotiation => error.TlsAlertNoRenegotiation,
             .missing_extension => error.TlsAlertMissingExtension,
             .unsupported_extension => error.TlsAlertUnsupportedExtension,
             .unrecognized_name => error.TlsAlertUnrecognizedName,
@@ -238,6 +252,13 @@ pub const Alert = enum(u8) {
         return [2]u8{
             @intFromEnum(Alert.Level.warning),
             @intFromEnum(Alert.close_notify),
+        };
+    }
+
+    pub fn noRenegotiation() [2]u8 {
+        return [2]u8{
+            @intFromEnum(Alert.Level.warning),
+            @intFromEnum(Alert.no_renegotiation),
         };
     }
 };

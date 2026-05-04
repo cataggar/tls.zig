@@ -241,6 +241,7 @@ pub const Handshake = struct {
     alpn_protocol_buf: [32]u8 = undefined,
     /// Transcript snapshot used as the base for TLS 1.3 post-handshake auth.
     post_handshake_transcript: ?Transcript = null,
+    post_handshake_auth_advertised: bool = false,
     client_application_traffic_secret: [64]u8 = undefined,
     client_application_traffic_secret_len: usize = 0,
     // statistics
@@ -351,7 +352,7 @@ pub const Handshake = struct {
             try h.readEncryptedServerFlight1(resumption_ticket != null); // server flight 1
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth, opt.rng); // client flight 2
-            h.savePostHandshakeAuthState(opt.auth);
+            h.savePostHandshakeAuthState(h.post_handshake_auth_advertised);
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
             try h.output.flush();
 
@@ -389,7 +390,7 @@ pub const Handshake = struct {
         if (h.tls_version == .tls_1_3) {
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth, opt.rng);
-            h.savePostHandshakeAuthState(opt.auth);
+            h.savePostHandshakeAuthState(h.post_handshake_auth_advertised);
             h.cipher = app_cipher;
         } else {
             // tls 1.2 specific handshake part
@@ -451,8 +452,8 @@ pub const Handshake = struct {
         return try Cipher.initTls13(h.cipher_suite, application_secret, .client);
     }
 
-    fn savePostHandshakeAuthState(h: *Self, auth: ?*CertKeyPair) void {
-        if (auth == null) {
+    fn savePostHandshakeAuthState(h: *Self, advertised: bool) void {
+        if (!advertised) {
             h.post_handshake_transcript = null;
             return;
         }
@@ -465,6 +466,8 @@ pub const Handshake = struct {
     }
 
     fn makeClientHello(h: *Self, opt: Options, resumption_ticket: ?ResumptionTicket) !void {
+        h.post_handshake_auth_advertised = false;
+
         // Prepare data
         const tls_versions = try CipherSuite.versions(opt.cipher_suites);
         const shared_keys: []const []const u8 = if (tls_versions != .tls_1_2) brk: {
@@ -494,17 +497,38 @@ pub const Handshake = struct {
         try w.slice(&[_]u8{ 0x01, 0x00 }); // no compression
         // Remeber position to write extensions length
         const ext_len_pos = try w.skip(2);
-        try w.extension(.supported_versions, supported_versions);
+        if (tls_versions == .tls_1_2) {
+            try w.emptyRenegotiationInfo();
+        }
+        if (tls_versions != .tls_1_2) {
+            try w.statusRequest();
+            try w.extension(.supported_versions, supported_versions);
+        }
         try w.extension(.signature_algorithms, common.supported_signature_algorithms);
+        if (tls_versions != .tls_1_2) {
+            try w.emptyExtension(.session_ticket);
+        }
         try w.extension(.supported_groups, opt.named_groups);
+        if (tls_versions == .tls_1_2) {
+            try w.ecPointFormats();
+            try w.emptyExtension(.session_ticket);
+            try w.emptyExtension(.encrypt_then_mac);
+        } else {
+            try w.ecPointFormats();
+        }
         try w.keyShare(opt.named_groups, shared_keys);
         try w.serverName(opt.host);
         if (opt.alpn_protocols.len > 0) {
             try w.alpn(opt.alpn_protocols);
         }
-        if (tls_versions != .tls_1_2 and opt.auth != null) {
-            try w.enumValue(proto.Extension.post_handshake_auth);
-            try w.int(u16, 0);
+        if (tls_versions != .tls_1_2) {
+            try w.emptyExtension(.post_handshake_auth);
+            h.post_handshake_auth_advertised = true;
+            try w.emptyExtension(.extended_master_secret);
+            try w.emptyRenegotiationInfo();
+            if (resumption_ticket == null) {
+                try w.extension(.psk_key_exchange_modes, &[_]proto.KeyExchangeModes{.psk_dhe_ke});
+            }
         }
         // binder key placeholder
         const binder_pos: ?usize = if (resumption_ticket) |ticket| brk: {
@@ -1178,19 +1202,43 @@ test "tls 1.3 process server flight" {
     }
 }
 
+test "tls 1.3 preserves post-handshake auth transcript without client cert" {
+    var h: Handshake = brk: {
+        var buffer: [1024]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buffer);
+        var reader: Io.Reader = .fixed(&data13.server_flight);
+        break :brk .{ .input = &reader, .output = &writer };
+    };
+    try initExampleHandshake(&h);
+
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .empty, .now_sec = 0 };
+    try h.readEncryptedServerFlight1(false);
+    _ = try h.generateApplicationCipher(null);
+
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    try h.makeClientFlight2Tls13(null, rng_impl.interface());
+    h.post_handshake_auth_advertised = true;
+    h.savePostHandshakeAuthState(h.post_handshake_auth_advertised);
+
+    try testing.expect(h.post_handshake_transcript != null);
+}
+
 test "create client hello" {
     const expected = testu.hexToBytes(
-        "16 03 03 00 6d " ++ // record header
-            "01 00 00 69 " ++ // handshake header
+        "16 03 03 00 79 " ++ // record header
+            "01 00 00 75 " ++ // handshake header
             "03 03 " ++ // protocol version
             "00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f " ++ // client random
             "00 " ++ // no session id
             "00 02 c0 2b " ++ // cipher suites
             "01 00 " ++ // compression methods
-            "00 3e " ++ // extensions length
-            "00 2b 00 03 02 03 03 " ++ // supported versions extension
+            "00 4a " ++ // extensions length
+            "ff 01 00 01 00 " ++ // renegotiation_info extension
             "00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01 " ++ // signature algorithms extension
             "00 0a 00 08 00 06 00 1d 00 17 00 18 " ++ // named groups extension
+            "00 0b 00 02 01 00 " ++ // EC point formats extension
+            "00 23 00 00 " ++ // session ticket extension
+            "00 16 00 00 " ++ // encrypt-then-MAC extension
             "00 00 00 0f 00 0d 00 00 0a 67 6f 6f 67 6c 65 2e 63 6f 6d ", // server name extension
     );
 
@@ -1218,8 +1266,8 @@ test "create client hello" {
 
     const actual = h.output.buffered();
     try testing.expectEqualSlices(u8, &expected, actual);
-    try testing.expectEqual(152, h.output.unusedCapacityLen());
-    try testing.expectEqual(114, expected.len);
+    try testing.expectEqual(140, h.output.unusedCapacityLen());
+    try testing.expectEqual(126, expected.len);
 }
 
 test "client hello advertises post-handshake auth with client cert" {
@@ -1248,6 +1296,57 @@ test "client hello advertises post-handshake auth with client cert" {
     try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
 }
 
+test "client hello advertises post-handshake auth without client cert" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 31 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) != null);
+    try testing.expect(h.post_handshake_auth_advertised);
+}
+
+test "client hello omits post-handshake auth for tls 1.2 only" {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = &[_]CipherSuite{CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var stream_writer: Io.Writer = .fixed(&buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+        .post_handshake_auth_advertised = true,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+
+    const ext = testu.hexToBytes("00 31 00 00");
+    try testing.expect(mem.indexOf(u8, h.output.buffered(), &ext) == null);
+    try testing.expect(!h.post_handshake_auth_advertised);
+}
+
 test "client hello size" {
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };
     const opt: Options = .{
@@ -1267,7 +1366,7 @@ test "client hello size" {
     };
     try h.initKeys(opt);
     try h.makeClientHello(opt, null);
-    try testing.expectEqual(1572 + opt.host.len, h.output.end);
+    try testing.expectEqual(1610 + opt.host.len, h.output.end);
     //try testing.expectEqual(2794 + opt.host.len, h.stream_writer.end);
 }
 
@@ -1453,19 +1552,27 @@ test "nonblock handshake" {
     }
 
     const expected_client_flight_1 = testu.hexToBytes(
-        \\ 16 03 03 00 9c
-        \\ 01 00 00 98
+        \\ 16 03 03 00 c2
+        \\ 01 00 00 be
         \\ 03 03
         \\ 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
         \\ 00
         \\ 00 02 13 02
         \\ 01 00
-        \\ 00 6d
+        \\ 00 93
+        \\ 00 05 00 05 01 00 00 00 00
         \\ 00 2b 00 03 02 03 04
         \\ 00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01
-        \\ 00 0a 00 04 00 02 00 1d 00 33 00 26 00 24 00 1d 00 20
+        \\ 00 23 00 00
+        \\ 00 0a 00 04 00 02 00 1d
+        \\ 00 0b 00 02 01 00
+        \\ 00 33 00 26 00 24 00 1d 00 20
         \\ 35 80 72 d6 36 58 80 d1 ae ea 32 9a df 91 21 38 38 51 ed 21 a2 8e 3b 75 e9 65 d0 d2 cd 16 62 54
         \\ 00 00 00 18 00 16 00 00 13 65 78 61 6d 70 6c 65 2e 75 6c 66 68 65 69 6d 2e 6e 65 74
+        \\ 00 31 00 00
+        \\ 00 17 00 00
+        \\ ff 01 00 01 00
+        \\ 00 2d 00 02 01 01
     );
 
     var res = try h.run(&.{}, &buffer);
