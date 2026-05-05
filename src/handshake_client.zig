@@ -489,6 +489,8 @@ pub const Handshake = struct {
             .tls_1_3 => &[_]proto.Version{.tls_1_3},
             .tls_1_2 => &[_]proto.Version{.tls_1_2},
         };
+        const tls12_offered = tls_versions != .tls_1_3;
+        const legacy_session_ticket = tls12_offered and resumption_ticket == null;
         const psk_binder_len = if (resumption_ticket == null) 0 else h.transcript.hashLength() + 3;
 
         var w: record.Writer = .initFromIo(h.output);
@@ -517,16 +519,18 @@ pub const Handshake = struct {
             try w.extension(.supported_versions, supported_versions);
         }
         try w.extension(.signature_algorithms, common.supported_signature_algorithms);
-        if (tls_versions != .tls_1_2) {
+        if (tls_versions != .tls_1_2 and legacy_session_ticket) {
             try w.emptyExtension(.session_ticket);
         }
         try w.extension(.supported_groups, opt.named_groups);
-        if (tls_versions == .tls_1_2) {
+        if (tls12_offered and offersTls12Ecdhe(opt.cipher_suites)) {
             try w.ecPointFormats();
+        }
+        if (tls_versions == .tls_1_2 and legacy_session_ticket) {
             try w.emptyExtension(.session_ticket);
+        }
+        if (tls12_offered and offersTls12Cbc(opt.cipher_suites)) {
             try w.emptyExtension(.encrypt_then_mac);
-        } else {
-            try w.ecPointFormats();
         }
         try w.keyShare(opt.named_groups, shared_keys);
         try w.serverName(opt.host);
@@ -572,6 +576,42 @@ pub const Handshake = struct {
         }
 
         h.output.advance(w.buffered().len);
+    }
+
+    fn offersTls12Ecdhe(cipher_list: []const CipherSuite) bool {
+        for (cipher_list) |cipher_suite| switch (cipher_suite) {
+            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+            .ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+            .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+            .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+            .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            => return true,
+            else => {},
+        };
+        return false;
+    }
+
+    fn offersTls12Cbc(cipher_list: []const CipherSuite) bool {
+        for (cipher_list) |cipher_suite| switch (cipher_suite) {
+            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+            .ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            .RSA_WITH_AES_128_CBC_SHA,
+            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+            .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+            .RSA_WITH_AES_128_CBC_SHA256,
+            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+            .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+            => return true,
+            else => {},
+        };
+        return false;
     }
 
     /// Process first flight of the messages from the server.
@@ -1512,14 +1552,14 @@ test "tls 1.3 certificate status extension is ignored" {
 
 test "create client hello" {
     const expected = testu.hexToBytes(
-        "16 03 03 00 86 " ++ // record header
-            "01 00 00 82 " ++ // handshake header
+        "16 03 03 00 82 " ++ // record header
+            "01 00 00 7e " ++ // handshake header
             "03 03 " ++ // protocol version
             "00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f " ++ // client random
             "00 " ++ // no session id
             "00 02 c0 2b " ++ // cipher suites
             "01 00 " ++ // compression methods
-            "00 57 " ++ // extensions length
+            "00 53 " ++ // extensions length
             "ff 01 00 01 00 " ++ // renegotiation_info extension
             "00 05 00 05 01 00 00 00 00 " ++ // status_request extension
             "00 17 00 00 " ++ // extended master secret extension
@@ -1527,7 +1567,6 @@ test "create client hello" {
             "00 0a 00 08 00 06 00 1d 00 17 00 18 " ++ // named groups extension
             "00 0b 00 02 01 00 " ++ // EC point formats extension
             "00 23 00 00 " ++ // session ticket extension
-            "00 16 00 00 " ++ // encrypt-then-MAC extension
             "00 00 00 0f 00 0d 00 00 0a 67 6f 6f 67 6c 65 2e 63 6f 6d ", // server name extension
     );
 
@@ -1555,8 +1594,107 @@ test "create client hello" {
 
     const actual = h.output.buffered();
     try testing.expectEqualSlices(u8, &expected, actual);
-    try testing.expectEqual(127, h.output.unusedCapacityLen());
-    try testing.expectEqual(139, expected.len);
+    try testing.expectEqual(131, h.output.unusedCapacityLen());
+    try testing.expectEqual(135, expected.len);
+}
+
+fn makeTestClientHello(buffer: []u8, cipher_suite_list: []const CipherSuite) ![]const u8 {
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const opt: Options = .{
+        .rng = rng_impl.interface(),
+        .host = "google.com",
+        .root_ca = .empty,
+        .cipher_suites = cipher_suite_list,
+        .named_groups = &[_]proto.NamedGroup{.x25519},
+        .now = .zero,
+    };
+
+    var stream_writer: Io.Writer = .fixed(buffer);
+    var h = Handshake{
+        .output = &stream_writer,
+        .input = undefined,
+    };
+    try h.initKeys(opt);
+    try h.makeClientHello(opt, null);
+    return h.output.buffered();
+}
+
+fn expectClientHelloCompatibilityExtensions(
+    cipher_suite_list: []const CipherSuite,
+    expect_ec_point_formats: bool,
+    expect_session_ticket: bool,
+    expect_encrypt_then_mac: bool,
+) !void {
+    var buffer: [2048]u8 = undefined;
+    const hello = try makeTestClientHello(&buffer, cipher_suite_list);
+
+    const ec_point_formats = testu.hexToBytes("00 0b 00 02 01 00");
+    const session_ticket = testu.hexToBytes("00 23 00 00");
+    const encrypt_then_mac = testu.hexToBytes("00 16 00 00");
+
+    try testing.expectEqual(expect_ec_point_formats, mem.indexOf(u8, hello, &ec_point_formats) != null);
+    try testing.expectEqual(expect_session_ticket, mem.indexOf(u8, hello, &session_ticket) != null);
+    try testing.expectEqual(expect_encrypt_then_mac, mem.indexOf(u8, hello, &encrypt_then_mac) != null);
+}
+
+test "client hello advertises compatibility extensions for tls 1.2 cbc clients" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{CipherSuite.ECDHE_RSA_WITH_AES_128_CBC_SHA},
+        true,
+        true,
+        true,
+    );
+}
+
+test "client hello omits encrypt_then_mac for tls 1.2 aead-only clients" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+        true,
+        true,
+        false,
+    );
+}
+
+test "client hello omits ec_point_formats for tls 1.2 rsa-only clients" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{CipherSuite.RSA_WITH_AES_128_CBC_SHA},
+        false,
+        true,
+        true,
+    );
+}
+
+test "client hello advertises compatibility extensions for mixed tls 1.2 cbc fallback" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{
+            CipherSuite.AES_256_GCM_SHA384,
+            CipherSuite.ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        },
+        true,
+        true,
+        true,
+    );
+}
+
+test "client hello omits encrypt_then_mac for mixed tls 1.2 aead fallback" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{
+            CipherSuite.AES_256_GCM_SHA384,
+            CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        },
+        true,
+        true,
+        false,
+    );
+}
+
+test "client hello omits legacy compatibility extensions for tls 1.3-only clients" {
+    try expectClientHelloCompatibilityExtensions(
+        &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
+        false,
+        false,
+        false,
+    );
 }
 
 test "client hello advertises status request" {
@@ -1810,7 +1948,7 @@ test "client hello size" {
     };
     try h.initKeys(opt);
     try h.makeClientHello(opt, null);
-    try testing.expectEqual(1610 + opt.host.len, h.output.end);
+    try testing.expectEqual(1614 + opt.host.len, h.output.end);
     //try testing.expectEqual(2794 + opt.host.len, h.stream_writer.end);
 }
 
@@ -2041,20 +2179,18 @@ test "nonblock handshake" {
     }
 
     const expected_client_flight_1 = testu.hexToBytes(
-        \\ 16 03 03 00 be
-        \\ 01 00 00 ba
+        \\ 16 03 03 00 b4
+        \\ 01 00 00 b0
         \\ 03 03
         \\ 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
         \\ 00
         \\ 00 02 13 02
         \\ 01 00
-        \\ 00 8f
+        \\ 00 85
         \\ 00 05 00 05 01 00 00 00 00
         \\ 00 2b 00 03 02 03 04
         \\ 00 0d 00 14 00 12 04 03 05 03 08 04 08 05 08 06 08 07 02 01 04 01 05 01
-        \\ 00 23 00 00
         \\ 00 0a 00 04 00 02 00 1d
-        \\ 00 0b 00 02 01 00
         \\ 00 33 00 26 00 24 00 1d 00 20
         \\ 35 80 72 d6 36 58 80 d1 ae ea 32 9a df 91 21 38 38 51 ed 21 a2 8e 3b 75 e9 65 d0 d2 cd 16 62 54
         \\ 00 00 00 18 00 16 00 00 13 65 78 61 6d 70 6c 65 2e 75 6c 66 68 65 69 6d 2e 6e 65 74

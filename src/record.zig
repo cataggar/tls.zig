@@ -495,6 +495,45 @@ test "status_request extension writer" {
     );
 }
 
+test "ec_point_formats extension writer" {
+    var buf: [6]u8 = undefined;
+    var w = Writer.init(&buf);
+
+    try w.ecPointFormats();
+
+    try testing.expectEqualSlices(
+        u8,
+        &testu.hexToBytes("00 0b 00 02 01 00"),
+        w.buffered(),
+    );
+}
+
+test "empty session_ticket extension writer" {
+    var buf: [4]u8 = undefined;
+    var w = Writer.init(&buf);
+
+    try w.emptyExtension(.session_ticket);
+
+    try testing.expectEqualSlices(
+        u8,
+        &testu.hexToBytes("00 23 00 00"),
+        w.buffered(),
+    );
+}
+
+test "empty encrypt_then_mac extension writer" {
+    var buf: [4]u8 = undefined;
+    var w = Writer.init(&buf);
+
+    try w.emptyExtension(.encrypt_then_mac);
+
+    try testing.expectEqualSlices(
+        u8,
+        &testu.hexToBytes("00 16 00 00"),
+        w.buffered(),
+    );
+}
+
 test "renegotiation_info extension writer" {
     var buf: [5]u8 = undefined;
     var w = Writer.init(&buf);
