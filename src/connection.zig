@@ -319,7 +319,9 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
-        err: ?anyerror = null,
+        err: ?Error = null,
+
+        pub const Error = @typeInfo(@typeInfo(@TypeOf(Connection.read)).@"fn".return_type.?).error_union.error_set;
 
         pub fn init(c: *Connection, buffer: []u8) Reader {
             return .{
@@ -362,7 +364,9 @@ pub const Connection = struct {
     pub const Writer = struct {
         conn: *Connection,
         interface: Io.Writer,
-        err: ?anyerror = null,
+        err: ?Error = null,
+
+        pub const Error = @typeInfo(@typeInfo(@TypeOf(Connection.writeAll)).@"fn".return_type.?).error_union.error_set;
 
         pub fn init(c: *Connection, buffer: []u8) Writer {
             return .{
