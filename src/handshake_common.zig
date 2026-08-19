@@ -306,6 +306,8 @@ pub const CertificateParser = struct {
     root_ca: Certificate.Bundle,
     host: []const u8,
     skip_verify: bool = false,
+    /// Verify the chain, but not that the certificate names the host.
+    skip_hostname_verify: bool = false,
     now_sec: i64,
 
     pub fn parseCertificate(h: *CertificateParser, d: *record.Decoder, tls_version: proto.Version) !void {
@@ -340,8 +342,8 @@ pub const CertificateParser = struct {
                     else => return err,
                 }
             } else { // first certificate
-                if (!h.skip_verify and h.host.len > 0) {
-                    try subject.verifyHostName(h.host);
+                if (!h.skip_verify and !h.skip_hostname_verify and h.host.len > 0) {
+                    try verifyIdentity(subject, h.host);
                 }
                 h.pub_key = try dupe(&h.pub_key_buf, subject.pubKey());
                 h.pub_key_algo = subject.pub_key_algo;
@@ -429,6 +431,102 @@ pub const CertificateParser = struct {
         };
     }
 };
+
+/// Verifies that `subject` names `host`, where `host` may be an IP literal.
+///
+/// `Certificate.verifyHostName` matches only `dNSName` SANs. An `iPAddress`
+/// SAN falls through its `else => {}`, and because the `commonName` fallback
+/// runs only when the SAN extension is *absent*, a certificate carrying an IP
+/// SAN cannot be matched by that function at all -- not even through its CN.
+///
+/// So a service reachable only by address, which is what a BMC, a hypervisor,
+/// and most lab equipment are, could not be verified at all: every trust
+/// anchor failed with `CertificateHostMismatch`, and the only way through was
+/// to turn verification off entirely.
+///
+/// RFC 6125 section 6.4 expects an IP reference identity to be matched
+/// against `iPAddress` SAN entries, and only against those -- an IP must not
+/// be matched against a `dNSName`, because a certificate for the *name*
+/// "192.168.1.1" says nothing about the *address* 192.168.1.1. That is why
+/// this dispatches on the form of `host` rather than trying both.
+pub fn verifyIdentity(
+    subject: Certificate.Parsed,
+    host: []const u8,
+) Certificate.Parsed.VerifyHostNameError!void {
+    const address = parseIpLiteral(host) orelse
+        // Not an address: the standard path, wildcards and all.
+        return subject.verifyHostName(host);
+    return verifyIpAddress(subject, address);
+}
+
+/// An IP reference identity, in the form an `iPAddress` SAN holds it: 4
+/// octets for IPv4, 16 for IPv6, network byte order, and nothing else.
+const IpLiteral = struct {
+    bytes: [16]u8,
+    len: u5,
+
+    fn slice(self: *const IpLiteral) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Parses `text` as an IP literal, or returns null if it is a host name.
+///
+/// A zone suffix (`fe80::1%eth0`) is stripped: it is local routing
+/// information and never appears in a certificate.
+fn parseIpLiteral(text: []const u8) ?IpLiteral {
+    if (text.len == 0) return null;
+
+    const bare = if (mem.indexOfScalar(u8, text, '%')) |zone| text[0..zone] else text;
+    if (bare.len == 0) return null;
+
+    var result: IpLiteral = .{ .bytes = undefined, .len = 0 };
+
+    if (Io.net.Ip4Address.parse(bare, 0)) |ip4| {
+        @memcpy(result.bytes[0..4], &ip4.bytes);
+        result.len = 4;
+        return result;
+    } else |_| {}
+
+    if (Io.net.Ip6Address.parse(bare, 0)) |ip6| {
+        @memcpy(result.bytes[0..16], &ip6.bytes);
+        result.len = 16;
+        return result;
+    } else |_| {}
+
+    return null;
+}
+
+/// Matches `address` against the certificate's `iPAddress` SAN entries.
+fn verifyIpAddress(
+    subject: Certificate.Parsed,
+    address: IpLiteral,
+) Certificate.Parsed.VerifyHostNameError!void {
+    const subject_alt_name = subject.subjectAltName();
+    // No SAN extension at all: there is nowhere an address could be
+    // asserted. A CN is a name, not an address, so it is not consulted.
+    if (subject_alt_name.len == 0) return error.CertificateHostMismatch;
+
+    const general_names = try Certificate.der.Element.parse(subject_alt_name, 0);
+    var name_i = general_names.slice.start;
+    while (name_i < general_names.slice.end) {
+        const general_name = try Certificate.der.Element.parse(subject_alt_name, name_i);
+        name_i = general_name.slice.end;
+
+        const tag: Certificate.GeneralNameTag =
+            @enumFromInt(@intFromEnum(general_name.identifier.tag));
+        if (tag != .iPAddress) continue;
+
+        const encoded = subject_alt_name[general_name.slice.start..general_name.slice.end];
+        // RFC 5280 section 4.2.1.6: exactly 4 or 16 octets. Anything else is
+        // malformed, and comparing against it would be comparing against
+        // something whose meaning is not defined.
+        if (encoded.len != 4 and encoded.len != 16) continue;
+        if (mem.eql(u8, encoded, address.slice())) return;
+    }
+
+    return error.CertificateHostMismatch;
+}
 
 fn SchemeHash(comptime scheme: proto.SignatureScheme) type {
     const Sha256 = crypto.hash.sha2.Sha256;
@@ -558,4 +656,121 @@ test "DhKeyPair.x25519" {
     );
     var kp = try DhKeyPair.init(seed, &.{.x25519});
     try testing.expectEqualSlices(u8, expected, try kp.sharedKey(.x25519, server_pub_key));
+}
+
+test "an IP literal is recognised, a host name is not" {
+    // The dispatch this whole path turns on: an address is matched against
+    // `iPAddress` SANs and a name against `dNSName` ones, and the two must
+    // never be confused -- a certificate for the *name* "192.168.1.1" says
+    // nothing about the *address*.
+    try testing.expectEqual(@as(u5, 4), parseIpLiteral("192.168.31.132").?.len);
+    try testing.expectEqual(@as(u5, 16), parseIpLiteral("2001:db8::1").?.len);
+    try testing.expectEqual(@as(u5, 16), parseIpLiteral("::1").?.len);
+
+    try testing.expect(parseIpLiteral("bmc.example") == null);
+    try testing.expect(parseIpLiteral("192.168.31.132.example.com") == null);
+    try testing.expect(parseIpLiteral("") == null);
+    try testing.expect(parseIpLiteral("999.999.999.999") == null);
+}
+
+test "an IPv6 zone suffix is stripped" {
+    // Zone identifiers are local routing information and never appear in a
+    // certificate, so `fe80::1%eth0` has to reach the SAN comparison as
+    // `fe80::1` rather than as a host name.
+    const zoned = parseIpLiteral("fe80::1%eth0").?;
+    const bare = parseIpLiteral("fe80::1").?;
+    try testing.expectEqualSlices(u8, bare.slice(), zoned.slice());
+}
+
+test "an IPv4 literal encodes as the four octets a SAN holds" {
+    const parsed = parseIpLiteral("192.168.31.132").?;
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 31, 132 }, parsed.slice());
+}
+
+/// A self-signed certificate with three SANs:
+/// `DNS:bmc.example`, `IP:192.168.31.132`, `IP:2001:db8::1`.
+const multi_san_der = testu.hexToBytes(
+    \\3082034130820229a00302010202142d695dd0357926093f6bd5a060771b756c
+    \\49cd34300d06092a864886f70d01010b050030163114301206035504030c0b62
+    \\6d632e6578616d706c653020170d3236303831393033303330345a180f323132
+    \\36303732363033303330345a30163114301206035504030c0b626d632e657861
+    \\6d706c6530820122300d06092a864886f70d01010105000382010f003082010a
+    \\0282010100c31291dc34d0848fbd6041da3115c6e3bc784f09761547b588ddb6
+    \\38f543046505b3f978cc7f3ae1d22277df2979c3b3a9e91b92f178b6425ecb41
+    \\f92609f77d1e19bff4c36c6a966d3ac590f46fd2db7b44f3c3af6d4216285623
+    \\ad2b0cbf61b4df4e3bf37d4945172ddb076ae48983f377675466305cb600a764
+    \\4b5761e823ad3184157735fa3bde0fa1248925eaf49ad7481fdf714af74c8484
+    \\3ca9403b7819aac51a7f93ced273853c287d6d0f7b45fd8865ed1756d66b8a1e
+    \\09a1265dd5f67071d37e5acb4fd7fcfa64d0c0fa06d1c2d2a91f70bd82a5e091
+    \\8d1cd388d6f54e50c8315eaf989c1046009edf91bfc30eca8cb94a01028e5fe3
+    \\f98dfbf0750203010001a38184308181301d0603551d0e04160414ecf4982bf8
+    \\7029856e4b37e19eb59277281f792b301f0603551d23041830168014ecf4982b
+    \\f87029856e4b37e19eb59277281f792b300f0603551d130101ff040530030101
+    \\ff302e0603551d1104273025820b626d632e6578616d706c658704c0a81f8487
+    \\1020010db8000000000000000000000001300d06092a864886f70d01010b0500
+    \\03820101007f92d4bc4d616cd29a3e2e6036896b63e6ebfd042df730ea2646a9
+    \\6ce8db30d49d1e74b88062b8be1379523068226548efcb516395ddf72cc4e892
+    \\61a0f1f93b57d8db2b1d7a3e4f669dd5fcd03155cd0a6718db1662e8fcf599ac
+    \\b6a9fe808d799dbec47565fe9a68eaae4084b7d1f44ccfc727911d41b8b21777
+    \\5b64a852e3f443f0c87ae5d85fbb8e77b7ea77d96bcafad4047779fc40527865
+    \\40a6eb30207e983988c09e10be529416fbf4c953360a4f32d551f9e2b3a235a9
+    \\43aad1b2a82b8dbc85cfd4b7c33c6d29b3611a8f78ee505ced12ab2ef4f6467d
+    \\d3765f0bd8d391b257affdc5177238de982eb93107a3de2994973709a5e72cbd
+    \\4e26b576b1
+);
+
+fn multiSan() !Certificate.Parsed {
+    const cert_bytes: Certificate = .{ .buffer = &multi_san_der, .index = 0 };
+    return cert_bytes.parse();
+}
+
+test "an IPv4 SAN is matched when connecting by that address" {
+    // Before this, every trust anchor failed here with
+    // `CertificateHostMismatch`: `Certificate.verifyHostName` looks only
+    // at `dNSName` entries, so a service reachable only by address could
+    // not be verified at all.
+    const parsed = try multiSan();
+    try verifyIdentity(parsed, "192.168.31.132");
+}
+
+test "an IPv6 SAN is matched, in any spelling of the same address" {
+    const parsed = try multiSan();
+    try verifyIdentity(parsed, "2001:db8::1");
+    // Comparison is on the 16 encoded octets, so the textual form does not
+    // have to match the one the certificate was issued with.
+    try verifyIdentity(parsed, "2001:0db8:0000:0000:0000:0000:0000:0001");
+}
+
+test "a different address on the same certificate is refused" {
+    const parsed = try multiSan();
+    try testing.expectError(
+        error.CertificateHostMismatch,
+        verifyIdentity(parsed, "192.168.31.133"),
+    );
+    try testing.expectError(
+        error.CertificateHostMismatch,
+        verifyIdentity(parsed, "2001:db8::2"),
+    );
+}
+
+test "the dNSName path still works, and is unaffected" {
+    const parsed = try multiSan();
+    try verifyIdentity(parsed, "bmc.example");
+    try testing.expectError(
+        error.CertificateHostMismatch,
+        verifyIdentity(parsed, "other.example"),
+    );
+}
+
+test "an address is not matched against a dNSName that looks like one" {
+    // RFC 6125 section 6.4: an IP reference identity matches `iPAddress`
+    // entries only. A certificate whose *name* is "192.168.31.132" must not
+    // authenticate the *address* 192.168.31.132.
+    const parsed = try multiSan();
+    // "bmc.example" is the only dNSName here, so any address that is not one
+    // of the two IP SANs must fail even though a dNSName exists.
+    try testing.expectError(
+        error.CertificateHostMismatch,
+        verifyIdentity(parsed, "10.0.0.1"),
+    );
 }
