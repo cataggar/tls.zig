@@ -42,6 +42,24 @@ pub const Options = struct {
     /// host name.
     insecure_skip_verify: bool = false,
 
+    /// Verify the certificate chain, but not that the certificate names
+    /// `host`.
+    ///
+    /// For when the caller has pinned one specific certificate as its only
+    /// trust anchor. That certificate *is* the identity being trusted, and
+    /// which name it carries is not part of the question -- the same
+    /// reasoning under which an SSH client pins a host key and treats the
+    /// host string as a lookup label.
+    ///
+    /// It is also what a tunnelled connection needs: when the socket goes to
+    /// `127.0.0.1` and the certificate names the service at the far end,
+    /// there is no single string that is both the connection's peer and the
+    /// certificate's subject.
+    ///
+    /// Narrower than `insecure_skip_verify`, which turns off the chain as
+    /// well. Prefer this one wherever it is enough.
+    skip_hostname_verify: bool = false,
+
     /// List of cipher suites to use.
     /// To use just tls 1.3 cipher suites:
     ///   .cipher_suites = &tls.CipherSuite.tls13,
@@ -267,6 +285,7 @@ pub const Handshake = struct {
             .host = opt.host,
             .root_ca = opt.root_ca,
             .skip_verify = opt.insecure_skip_verify,
+            .skip_hostname_verify = opt.skip_hostname_verify,
             .now_sec = opt.now.toSeconds(),
         };
     }
