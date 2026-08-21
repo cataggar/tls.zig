@@ -26,6 +26,7 @@ pub const Connection = struct {
     max_encrypt_seq: u64 = std.math.maxInt(u64) - 1,
     key_update_requested: bool = false,
     received_close_notify: bool = false,
+    close_alert: proto.Alert = .close_notify,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
     cleartext_storage: [cipher.max_ciphertext_record_len]u8 = undefined,
@@ -83,7 +84,7 @@ pub const Connection = struct {
             // Write alert on tls errors.
             // Stream errors return to the caller.
             if (mem.startsWith(u8, @errorName(err), "Tls"))
-                try c.encryptWrite(.alert, &proto.alertFromError(err));
+                @atomicStore(proto.Alert, &c.close_alert, proto.Alert.fromError(err), .monotonic);
             return err;
         };
     }
@@ -93,7 +94,7 @@ pub const Connection = struct {
     /// record.
     fn nextRecord(c: *Self, buffer: []u8) ![]const u8 {
         assert(c.cleartext_buf.len == 0);
-        if (c.received_close_notify) return error.EndOfStream;
+        if (@atomicLoad(bool, &c.received_close_notify, .monotonic)) return error.EndOfStream;
         while (true) {
             const rec = try Record.read(c.input);
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
@@ -113,7 +114,7 @@ pub const Connection = struct {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
                     try proto.Alert.parse(cleartext[0..2].*).toError();
                     // server side clean shutdown
-                    c.received_close_notify = true;
+                    @atomicStore(bool, &c.received_close_notify, true, .monotonic);
                     return error.EndOfStream;
                 },
                 else => return error.TlsUnexpectedMessage,
@@ -221,12 +222,13 @@ pub const Connection = struct {
     }
 
     pub fn eof(c: *Self) bool {
-        return c.received_close_notify and c.cleartext_buf.len == 0;
+        return @atomicLoad(bool, &c.received_close_notify, .monotonic) and c.cleartext_buf.len == 0;
     }
 
     pub fn close(c: *Self) anyerror!void {
-        if (c.received_close_notify) return;
-        try c.writeRecord(.alert, &proto.Alert.closeNotify());
+        if (@atomicLoad(bool, &c.received_close_notify, .monotonic)) return;
+        const alert = @atomicLoad(proto.Alert, &c.close_alert, .monotonic);
+        try c.writeRecord(.alert, &alert.format());
     }
 
     // write/read
@@ -257,7 +259,7 @@ pub const Connection = struct {
             const cleartext = c.nextRecord(buffer) catch |err| {
                 if (err == error.EndOfStream) return 0;
                 if (mem.startsWith(u8, @errorName(err), "Tls"))
-                    try c.encryptWrite(.alert, &proto.alertFromError(err));
+                    @atomicStore(proto.Alert, &c.close_alert, proto.Alert.fromError(err), .monotonic);
                 return err;
             };
             if (cleartext.ptr == buffer.ptr) {
@@ -317,7 +319,9 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
-        err: ?anyerror = null,
+        err: ?Error = null,
+
+        pub const Error = @typeInfo(@typeInfo(@TypeOf(Connection.read)).@"fn".return_type.?).error_union.error_set;
 
         pub fn init(c: *Connection, buffer: []u8) Reader {
             return .{
@@ -360,7 +364,9 @@ pub const Connection = struct {
     pub const Writer = struct {
         conn: *Connection,
         interface: Io.Writer,
-        err: ?anyerror = null,
+        err: ?Error = null,
+
+        pub const Error = @typeInfo(@typeInfo(@TypeOf(Connection.writeAll)).@"fn".return_type.?).error_union.error_set;
 
         pub fn init(c: *Connection, buffer: []u8) Writer {
             return .{
@@ -392,9 +398,23 @@ pub const Connection = struct {
             // Last element of `data` is repeated as necessary so that it is
             // written `splat` number of times, which may be zero.
             const pattern = data[data.len - 1];
-            for (0..splat) |_| {
-                try self.writeAll(pattern);
-                n += pattern.len;
+            switch (pattern.len) {
+                0 => {},
+                1 => {
+                    var buffer: [cipher.max_cleartext_len]u8 = undefined;
+                    @memset(&buffer, pattern[0]);
+                    var remaining = splat;
+                    while (remaining > 0) {
+                        const chunk_len = @min(remaining, buffer.len);
+                        try self.writeAll(buffer[0..chunk_len]);
+                        remaining -= chunk_len;
+                    }
+                    n += splat;
+                },
+                else => for (0..splat) |_| {
+                    try self.writeAll(pattern);
+                    n += pattern.len;
+                },
             }
 
             // Number of bytes consumed from `data` is returned, excluding bytes
@@ -434,7 +454,10 @@ test "encrypt decrypt" {
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };
     const rng = rng_impl.interface();
     var output_buf: [1024]u8 = undefined;
-    var stream_reader: Io.Reader = .fixed(&data12.server_pong ** 4);
+    // Records are decrypted in place inside the reader's buffer, so the test
+    // data has to be writable; `var` makes a mutable copy of it.
+    var input_data = data12.server_pong ++ data12.server_pong ++ data12.server_pong ++ data12.server_pong;
+    var stream_reader: Io.Reader = .fixed(&input_data);
     var stream_writer: Io.Writer = .fixed(&output_buf);
     var conn: Connection = .{
         .input = &stream_reader,
@@ -562,6 +585,7 @@ test "tls 1.2 malformed hello request sends fatal decode error" {
     conn.cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x80);
 
     try testing.expectError(error.TlsDecodeError, conn.next());
+    try conn.close();
     try expectEncryptedAlert(&server_cipher, stream_writer.buffered(), proto.alertFromError(error.TlsDecodeError));
 }
 
@@ -819,7 +843,7 @@ pub const NonBlock = struct {
             .ciphertext_pos = input.seek,
             .unused_ciphertext = input.buffered(),
             .cleartext = cleartext[0..n],
-            .closed = self.inner.received_close_notify,
+            .closed = @atomicLoad(bool, &self.inner.received_close_notify, .monotonic),
         };
     }
 
