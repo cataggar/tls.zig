@@ -585,6 +585,7 @@ test "tls 1.2 malformed hello request sends fatal decode error" {
     conn.cipher.ECDHE_RSA_WITH_AES_128_CBC_SHA.rng = testu.random(0x80);
 
     try testing.expectError(error.TlsDecodeError, conn.next());
+    try conn.close();
     try expectEncryptedAlert(&server_cipher, stream_writer.buffered(), proto.alertFromError(error.TlsDecodeError));
 }
 
