@@ -1,5 +1,9 @@
 # tls.zig
 
+This miz-compatible branch targets Zig 0.17.0. It retains the TLS 1.2
+compatibility and ClientHello extension policy from commit `2621e411`.
+Run `zig build test` for unit tests and `zig build` for the examples.
+
 Zig TLS library, characteristics:
 * TLS 1.2 and TLS 1.3 client
 * TLS 1.3 server
@@ -385,5 +389,4 @@ error: TlsAlertUnrecognizedName
         try cmn.get(allocator, domain, null, true, true, .{
         ^
 -->
-
 

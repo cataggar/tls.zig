@@ -133,7 +133,7 @@ pub const Connection = struct {
             if (end > cleartext.len) return error.TlsUnsupportedFragmentedHandshakeMessage;
 
             const hs_msg = cleartext[off..end];
-            const handshake_type: proto.Handshake = @enumFromInt(hs_msg[0]);
+            const handshake_type: proto.Handshake = @fromBackingInt(@intCast(hs_msg[0]));
             switch (handshake_type) {
                 .hello_request => {
                     if (hs_msg.len != 4) return error.TlsDecodeError;
@@ -150,7 +150,7 @@ pub const Connection = struct {
                     if (hs_msg.len != 5) return error.TlsDecodeError;
                     // rfc: Upon receiving a KeyUpdate, the receiver MUST update its receiving keys.
                     try c.cipher.keyUpdateDecrypt();
-                    const key: proto.KeyUpdateRequest = @enumFromInt(hs_msg[4]);
+                    const key: proto.KeyUpdateRequest = @fromBackingInt(@intCast(hs_msg[4]));
                     switch (key) {
                         .update_requested => @atomicStore(bool, &c.key_update_requested, true, .monotonic),
                         .update_not_requested => {},
@@ -434,7 +434,8 @@ test "encrypt decrypt" {
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };
     const rng = rng_impl.interface();
     var output_buf: [1024]u8 = undefined;
-    var stream_reader: Io.Reader = .fixed(&data12.server_pong ** 4);
+    const pong = data12.server_pong ++ data12.server_pong ++ data12.server_pong ++ data12.server_pong;
+    var stream_reader: Io.Reader = .fixed(&pong);
     var stream_writer: Io.Writer = .fixed(&output_buf);
     var conn: Connection = .{
         .input = &stream_reader,
@@ -566,8 +567,8 @@ test "tls 1.2 malformed hello request sends fatal decode error" {
 }
 
 test "post-handshake auth without client certificate sends empty certificate" {
-    const client_secret = [_]u8{0x11} ** 32;
-    const server_secret = [_]u8{0x22} ** 32;
+    const client_secret: [32]u8 = @splat(0x11);
+    const server_secret: [32]u8 = @splat(0x22);
     const secret: Transcript.Secret = .{
         .client = &client_secret,
         .server = &server_secret,

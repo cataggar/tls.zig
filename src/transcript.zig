@@ -229,7 +229,7 @@ fn TranscriptT(comptime Hash: type) type {
         }
 
         fn serverCertificateVerify(self: *Self) []const u8 {
-            self.buffer = ([1]u8{0x20} ** 64) ++
+            self.buffer = @as([64]u8, @splat(0x20)) ++
                 "TLS 1.3, server CertificateVerify\x00".* ++
                 self.hash.peek();
             return &self.buffer;
@@ -237,7 +237,7 @@ fn TranscriptT(comptime Hash: type) type {
 
         // ref: https://www.rfc-editor.org/rfc/rfc8446#section-4.4.3
         fn clientCertificateVerify(self: *Self) []u8 {
-            self.buffer = ([1]u8{0x20} ** 64) ++
+            self.buffer = @as([64]u8, @splat(0x20)) ++
                 "TLS 1.3, client CertificateVerify\x00".* ++
                 self.hash.peek();
             return &self.buffer;
@@ -361,7 +361,7 @@ fn TranscriptT(comptime Hash: type) type {
             const hello_hash = self.hash.peek();
 
             const empty_hash = tls.emptyHash(Hash);
-            const zeroes = [1]u8{0} ** hash_length;
+            const zeroes: [hash_length]u8 = @splat(0);
             const early_secret = if (self.handshake_secret) |hs| hs else Hkdf.extract(&[1]u8{0}, &zeroes);
             const hs_derived_secret = hkdfExpandLabel(Hkdf, early_secret, "derived", &empty_hash, hash_length);
 
@@ -385,7 +385,7 @@ fn TranscriptT(comptime Hash: type) type {
             const handshake_hash = self.hash.peek();
 
             const empty_hash = tls.emptyHash(Hash);
-            const zeroes = [1]u8{0} ** hash_length;
+            const zeroes: [hash_length]u8 = @splat(0);
             const ap_derived_secret = hkdfExpandLabel(Hkdf, self.handshake_secret.?, "derived", &empty_hash, hash_length);
             const master_secret = Hkdf.extract(&ap_derived_secret, &zeroes);
 
@@ -400,7 +400,7 @@ fn TranscriptT(comptime Hash: type) type {
         fn resumptionSecret(self: *Self) []const u8 {
             const handshake_hash = self.hash.peek();
             const empty_hash = tls.emptyHash(Hash);
-            const zeroes = [1]u8{0} ** hash_length;
+            const zeroes: [hash_length]u8 = @splat(0);
             const ap_derived_secret = hkdfExpandLabel(Hkdf, self.handshake_secret.?, "derived", &empty_hash, hash_length);
             const master_secret = Hkdf.extract(&ap_derived_secret, &zeroes);
             self.buffer[0..hash_length].* = hkdfExpandLabel(Hkdf, master_secret, "res master", &handshake_hash, hash_length);
